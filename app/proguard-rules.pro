@@ -1,0 +1,3 @@
+-dontwarn org.apache.sshd.**
+-keep class com.kissh kitty.** { *; }
+-keep class * extends androidx.room.RoomDatabase

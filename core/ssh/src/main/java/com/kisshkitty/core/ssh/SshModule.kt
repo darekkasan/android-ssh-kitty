@@ -1,0 +1,18 @@
+package com.kisshkitty.core.ssh
+
+import dagger.Module
+import dagger.Provides
+import dagger.hilt.InstallIn
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Singleton
+
+@Module
+@InstallIn(SingletonComponent::class)
+object SshModule {
+
+    @Provides
+    @Singleton
+    fun provideSshConnectionManager(): SshConnectionManager {
+        return SshConnectionManager()
+    }
+}
