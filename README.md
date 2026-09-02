@@ -1,5 +1,7 @@
 # KisshKitty
 
+> **Note**: This project was developed with the assistance of AI (OpenCode).
+
 A modern SSH client for Android with Kitty image protocol support.
 
 ## Features
@@ -63,4 +65,4 @@ imgcat image.png
 
 ## License
 
-MIT License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
