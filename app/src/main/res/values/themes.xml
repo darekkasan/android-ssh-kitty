@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.KisshKitty" parent="android:Theme.Material.NoActionBar">
+        <item name="android:colorPrimary">#90CAF9</item>
+        <item name="android:colorPrimaryDark">#1A1C1E</item>
+        <item name="android:colorAccent">#90CAF9</item>
+        <item name="android:statusBarColor">#1A1C1E</item>
+        <item name="android:navigationBarColor">#1A1C1E</item>
+        <item name="android:windowBackground">#1A1C1E</item>
+    </style>
+</resources>
