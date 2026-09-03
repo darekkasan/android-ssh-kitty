@@ -1,15 +1,10 @@
 package com.kisshkitty.core.ssh
 
 import net.schmizz.sshj.SSHClient
-import net.schmizz.sshj.common.KeyType
-import net.schmizz.sshj.common.Message
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
-import net.schmizz.sshj.userauth.keyprovider.FileKeyProvider
-import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
-import java.security.KeyPair
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -18,6 +13,7 @@ class SshConnectionManager @Inject constructor() {
 
     private var currentClient: SSHClient? = null
     private var currentSession: Session? = null
+    private var currentShell: Session.Shell? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
 
@@ -30,10 +26,8 @@ class SshConnectionManager @Inject constructor() {
         // Connect
         when {
             config.keyPath != null -> {
-                val keyFile = File(config.keyPath)
-                val keyProvider = client.loadKeyProvider(keyFile)
                 client.connect(config.host, config.port)
-                client.authPublickey(config.username, keyProvider)
+                client.authPublickey(config.username, config.keyPath)
             }
             config.password != null -> {
                 client.connect(config.host, config.port)
@@ -49,6 +43,7 @@ class SshConnectionManager @Inject constructor() {
 
         currentClient = client
         currentSession = session
+        currentShell = shell
         inputStream = shell.inputStream
         outputStream = shell.outputStream
 
@@ -85,6 +80,7 @@ class SshConnectionManager @Inject constructor() {
         try {
             inputStream?.close()
             outputStream?.close()
+            currentShell?.close()
             currentSession?.close()
             currentClient?.disconnect()
         } catch (e: Exception) {
@@ -92,6 +88,7 @@ class SshConnectionManager @Inject constructor() {
         } finally {
             currentClient = null
             currentSession = null
+            currentShell = null
             inputStream = null
             outputStream = null
         }
