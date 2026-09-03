@@ -17,8 +17,8 @@ class KittyProtocolParser {
 
     companion object {
         // APC introducer and terminator
-        private const val APC_START = "\u001B_"  // ESC _
-        private const val APC_END = "\u001B\\"    // ESC \
+        const val APC_START = "\u001B_"  // ESC _
+        const val APC_END = "\u001B\\"    // ESC \
         
         // Image formats
         const val FORMAT_RGB = 24
