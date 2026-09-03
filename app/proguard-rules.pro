@@ -5,3 +5,7 @@
 -keep class org.bouncycastle.** { *; }
 -dontwarn net.schmizz.sshj.**
 -dontwarn org.bouncycastle.**
+-dontwarn sun.security.x509.**
+-dontwarn sun.security.ssl.**
+-dontwarn net.i2p.crypto.eddsa.**
+-dontwarn javax.security.auth.**
