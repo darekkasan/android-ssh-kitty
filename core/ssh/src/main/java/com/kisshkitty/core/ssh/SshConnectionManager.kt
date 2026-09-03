@@ -40,7 +40,7 @@ class SshConnectionManager @Inject constructor() {
         // Open interactive shell session
         val session = client.startSession()
         session.allocateDefaultPty()
-        val shell = session.openShell()
+        val shell = session.startShell()
 
         currentClient = client
         currentSession = session
