@@ -12,8 +12,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -207,24 +205,11 @@ fun TerminalScreen(
     val kittyImages by viewModel.kittyImages.collectAsState()
 
     val keyboardController = LocalSoftwareKeyboardController.current
-    val focusRequester = remember { FocusRequester() }
     var inputText by remember { mutableStateOf("") }
 
     // Auto-connect on first load
     LaunchedEffect(hostId) {
         viewModel.connect(hostId)
-    }
-
-    // Auto-focus on connect
-    LaunchedEffect(terminalState) {
-        if (terminalState is TerminalState.Connected) {
-            kotlinx.coroutines.delay(500)
-            try {
-                focusRequester.requestFocus()
-            } catch (e: Exception) {
-                // Ignore focus errors
-            }
-        }
     }
 
     Scaffold(
@@ -264,7 +249,6 @@ fun TerminalScreen(
                     .fillMaxSize()
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
-                            focusRequester.requestFocus()
                             keyboardController?.show()
                         }
                     }
@@ -278,7 +262,7 @@ fun TerminalScreen(
                 )
             }
 
-            // Hidden text field for keyboard input - receives focus and keyboard events
+            // Hidden text field for keyboard input
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
@@ -301,9 +285,7 @@ fun TerminalScreen(
                         inputText = newValue
                     }
                 },
-                modifier = Modifier
-                    .focusRequester(focusRequester)
-                    .size(0.dp),
+                modifier = Modifier.size(0.dp),
                 cursorBrush = SolidColor(Color.Transparent),
                 textStyle = TextStyle(color = Color.Transparent)
             )
