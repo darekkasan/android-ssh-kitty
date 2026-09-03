@@ -37,8 +37,9 @@ class SshConnectionManager @Inject constructor() {
             else -> throw IllegalStateException("Either password or keyPath must be provided")
         }
 
-        // Open interactive shell session
+        // Open interactive shell session with PTY
         val session = client.startSession()
+        session.allocatePTY("xterm-256color", 80, 24, 0, 0, emptyMap())
         val shell = session.startShell()
 
         currentClient = client
@@ -71,7 +72,9 @@ class SshConnectionManager @Inject constructor() {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        // PTY resize - not available in current SSHJ version
+        currentSession?.let { session ->
+            session.allocatePTY("xterm-256color", cols, rows, 0, 0, emptyMap())
+        }
     }
 
     fun disconnect() {

@@ -4,8 +4,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
@@ -15,10 +13,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
@@ -178,7 +174,6 @@ fun TerminalScreen(
     val terminalColors by viewModel.terminalColors.collectAsState()
     val kittyImages by viewModel.kittyImages.collectAsState()
 
-    var inputText by remember { mutableStateOf("") }
     val keyboardController = LocalSoftwareKeyboardController.current
 
     Scaffold(
@@ -205,7 +200,7 @@ fun TerminalScreen(
             )
         }
     ) { paddingValues ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
@@ -214,8 +209,7 @@ fun TerminalScreen(
             // Terminal display
             Box(
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
+                    .fillMaxSize()
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
                             keyboardController?.show()
@@ -231,59 +225,38 @@ fun TerminalScreen(
                 )
             }
 
-            // Input area - always visible
-            OutlinedTextField(
-                value = inputText,
-                onValueChange = { inputText = it },
+            // Special keys - floating at bottom
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .align(Alignment.BottomCenter)
                     .padding(8.dp)
-                    .onKeyEvent { event ->
-                        if (event.type == KeyEventType.KeyDown && event.key == Key.Enter) {
-                            viewModel.sendInput(inputText + "\r")
-                            inputText = ""
-                            true
-                        } else {
-                            false
-                        }
-                    },
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(
-                    onSend = {
-                        viewModel.sendInput(inputText + "\r")
-                        inputText = ""
-                    }
-                ),
-                placeholder = { Text("Type command...", color = Color.Gray) }
-            )
-
-            // Special keys row
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly
             ) {
-                SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
-                SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
-                SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
-                SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
-            }
+                // Main special keys
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
+                    SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
+                    SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
+                    SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
+                }
 
-            // Arrow keys
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
-                Spacer(modifier = Modifier.width(8.dp))
-                SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
-                SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
-                SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
+                Spacer(modifier = Modifier.height(4.dp))
+
+                // Arrow keys
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
+                    SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
+                    SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
+                }
             }
         }
     }
