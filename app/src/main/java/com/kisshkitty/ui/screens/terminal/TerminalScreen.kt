@@ -22,7 +22,10 @@ import androidx.lifecycle.viewModelScope
 import com.kisshkitty.core.kitty.KittyImage
 import com.kisshkitty.core.kitty.KittyImageRenderer
 import com.kisshkitty.core.terminal.TerminalEmulator
+import com.kisshkitty.core.ssh.SshConfig
 import com.kisshkitty.core.ssh.SshConnectionManager
+import com.kisshkitty.data.Host
+import com.kisshkitty.data.HostRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -34,7 +37,8 @@ import javax.inject.Inject
 
 @HiltViewModel
 class TerminalViewModel @Inject constructor(
-    private val sshConnectionManager: SshConnectionManager
+    private val sshConnectionManager: SshConnectionManager,
+    private val hostRepository: HostRepository
 ) : ViewModel() {
 
     private val _terminalState = MutableStateFlow<TerminalState>(TerminalState.Disconnected)
@@ -56,9 +60,23 @@ class TerminalViewModel @Inject constructor(
     private val kittyRenderer = KittyImageRenderer()
     private var readingJob: kotlinx.coroutines.Job? = null
 
-    fun connect(config: com.kisshkitty.core.ssh.SshConfig) {
+    fun connect(hostId: String) {
         viewModelScope.launch {
             _terminalState.value = TerminalState.Connecting
+            val host = hostRepository.getHostById(hostId)
+            if (host == null) {
+                _terminalState.value = TerminalState.Error("Host not found")
+                return@launch
+            }
+
+            val config = SshConfig(
+                host = host.host,
+                port = host.port,
+                username = host.username,
+                password = host.password,
+                keyPath = host.keyPath
+            )
+
             val result = sshConnectionManager.connect(config)
             result.fold(
                 onSuccess = { connection ->
@@ -164,7 +182,7 @@ enum class SpecialKey {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TerminalScreen(
-    sessionId: String,
+    hostId: String,
     onDisconnect: () -> Unit,
     viewModel: TerminalViewModel = hiltViewModel()
 ) {
@@ -176,6 +194,11 @@ fun TerminalScreen(
 
     val keyboardController = LocalSoftwareKeyboardController.current
 
+    // Auto-connect on first load
+    LaunchedEffect(hostId) {
+        viewModel.connect(hostId)
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -184,7 +207,7 @@ fun TerminalScreen(
                         when (terminalState) {
                             is TerminalState.Connected -> "Connected to ${(terminalState as TerminalState.Connected).host}"
                             is TerminalState.Connecting -> "Connecting..."
-                            is TerminalState.Error -> "Error"
+                            is TerminalState.Error -> "Error: ${(terminalState as TerminalState.Error).message}"
                             is TerminalState.Disconnected -> "Disconnected"
                         }
                     )
@@ -256,6 +279,37 @@ fun TerminalScreen(
                     SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
                     SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
                     SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
+                }
+            }
+
+            // Error display
+            if (terminalState is TerminalState.Error) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.8f))
+                        .pointerInput(Unit) {
+                            detectTapGestures {
+                                viewModel.connect(hostId)
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Text(
+                            text = (terminalState as TerminalState.Error).message,
+                            color = Color.Red,
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                        Text(
+                            text = "Tap to retry",
+                            color = Color.Gray,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
                 }
             }
         }

@@ -23,7 +23,7 @@ fun KisshNavHost(
         composable(Screen.HostList.route) {
             HostListScreen(
                 onConnectClick = { hostId ->
-                    navController.navigate(Screen.Connection.createRoute(hostId))
+                    navController.navigate(Screen.Terminal.createRoute(hostId))
                 },
                 onSettingsClick = {
                     navController.navigate(Screen.Settings.route)
@@ -32,32 +32,14 @@ fun KisshNavHost(
         }
 
         composable(
-            route = Screen.Connection.route,
+            route = Screen.Terminal.route,
             arguments = listOf(
                 navArgument("hostId") { type = NavType.StringType }
             )
         ) { backStackEntry ->
             val hostId = backStackEntry.arguments?.getString("hostId") ?: ""
-            ConnectionScreen(
-                hostId = hostId,
-                onConnected = { sessionId ->
-                    navController.navigate(Screen.Terminal.createRoute(sessionId))
-                },
-                onBack = {
-                    navController.popBackStack()
-                }
-            )
-        }
-
-        composable(
-            route = Screen.Terminal.route,
-            arguments = listOf(
-                navArgument("sessionId") { type = NavType.StringType }
-            )
-        ) { backStackEntry ->
-            val sessionId = backStackEntry.arguments?.getString("sessionId") ?: ""
             TerminalScreen(
-                sessionId = sessionId,
+                hostId = hostId,
                 onDisconnect = {
                     navController.popBackStack(Screen.HostList.route, false)
                 }
@@ -76,11 +58,8 @@ fun KisshNavHost(
 
 sealed class Screen(val route: String) {
     data object HostList : Screen("hosts")
-    data object Connection : Screen("connection/{hostId}") {
-        fun createRoute(hostId: String) = "connection/$hostId"
-    }
-    data object Terminal : Screen("terminal/{sessionId}") {
-        fun createRoute(sessionId: String) = "terminal/$sessionId"
+    data object Terminal : Screen("terminal/{hostId}") {
+        fun createRoute(hostId: String) = "terminal/$hostId"
     }
     data object Settings : Screen("settings")
 }
