@@ -1,3 +1,7 @@
 -dontwarn org.apache.sshd.**
--keep class com.kissh kitty.** { *; }
+-keep class com.kisshkitty.** { *; }
 -keep class * extends androidx.room.RoomDatabase
+-keep class net.schmizz.sshj.** { *; }
+-keep class org.bouncycastle.** { *; }
+-dontwarn net.schmizz.sshj.**
+-dontwarn org.bouncycastle.**
