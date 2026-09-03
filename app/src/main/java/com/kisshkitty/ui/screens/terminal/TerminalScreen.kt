@@ -5,6 +5,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
@@ -15,12 +16,14 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -205,6 +208,7 @@ fun TerminalScreen(
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
+    var inputText by remember { mutableStateOf("") }
 
     // Auto-connect on first load
     LaunchedEffect(hostId) {
@@ -272,6 +276,34 @@ fun TerminalScreen(
                     modifier = Modifier.fillMaxSize()
                 )
             }
+
+            // Hidden text field for keyboard input - receives focus and keyboard events
+            BasicTextField(
+                value = inputText,
+                onValueChange = { newValue ->
+                    if (newValue.endsWith("\n") || newValue.endsWith("\r")) {
+                        // Enter pressed - send accumulated text + newline
+                        viewModel.sendInput(inputText + "\n")
+                        inputText = ""
+                    } else if (newValue.length > inputText.length) {
+                        // Character typed - send only the new character
+                        val newChar = newValue.last()
+                        viewModel.sendInput(newChar.toString())
+                        inputText = newValue
+                    } else if (newValue.length < inputText.length) {
+                        // Backspace pressed
+                        viewModel.sendInput("\b")
+                        inputText = newValue
+                    } else {
+                        inputText = newValue
+                    }
+                },
+                modifier = Modifier
+                    .focusRequester(focusRequester)
+                    .size(0.dp),
+                cursorBrush = SolidColor(Color.Transparent),
+                textStyle = TextStyle(color = Color.Transparent)
+            )
 
             // Special keys - floating at bottom
             Column(
