@@ -13,7 +13,7 @@ class SshConnectionManager @Inject constructor() {
 
     private var currentClient: SSHClient? = null
     private var currentSession: Session? = null
-    private var currentCommand: Session.Command? = null
+    private var currentShell: Session.Shell? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
 
@@ -37,17 +37,18 @@ class SshConnectionManager @Inject constructor() {
             else -> throw IllegalStateException("Either password or keyPath must be provided")
         }
 
-        // Open shell session
+        // Open interactive shell session
         val session = client.startSession()
-        val command = session.exec("bash -l")
+        session.allocateDefaultPty()
+        val shell = session.openShell()
 
         currentClient = client
         currentSession = session
-        currentCommand = command
-        inputStream = command.inputStream
-        outputStream = command.outputStream
+        currentShell = shell
+        inputStream = shell.inputStream
+        outputStream = shell.outputStream
 
-        Result.success(SshConnection(client, session, command))
+        Result.success(SshConnection(client, session, shell))
     } catch (e: Exception) {
         Result.failure(e)
     }
@@ -71,14 +72,16 @@ class SshConnectionManager @Inject constructor() {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        // PTY resize - not available in exec mode
+        currentSession?.let { session ->
+            session.allocatePty("xterm-256color", cols, rows, 0, 0)
+        }
     }
 
     fun disconnect() {
         try {
             inputStream?.close()
             outputStream?.close()
-            currentCommand?.close()
+            currentShell?.close()
             currentSession?.close()
             currentClient?.disconnect()
         } catch (e: Exception) {
@@ -86,7 +89,7 @@ class SshConnectionManager @Inject constructor() {
         } finally {
             currentClient = null
             currentSession = null
-            currentCommand = null
+            currentShell = null
             inputStream = null
             outputStream = null
         }
@@ -110,5 +113,5 @@ data class SshConfig(
 data class SshConnection(
     val client: SSHClient,
     val session: Session,
-    val command: Session.Command
+    val shell: Session.Shell
 )

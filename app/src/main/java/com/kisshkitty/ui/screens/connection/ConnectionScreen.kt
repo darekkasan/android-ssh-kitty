@@ -1,8 +1,6 @@
 package com.kisshkitty.ui.screens.connection
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -35,26 +33,31 @@ class ConnectionViewModel @Inject constructor(
     fun loadHost(hostId: String) {
         viewModelScope.launch {
             _host.value = hostRepository.getHostById(hostId)
+            // Auto-connect after loading host
+            _host.value?.let { connectWithHost(it) }
         }
     }
 
     fun connect() {
         val currentHost = _host.value ?: return
-        
+        connectWithHost(currentHost)
+    }
+
+    private fun connectWithHost(host: Host) {
         viewModelScope.launch {
             _connectionState.value = ConnectionState.Connecting
-            
+
             val config = SshConfig(
-                host = currentHost.host,
-                port = currentHost.port,
-                username = currentHost.username,
-                password = currentHost.password,
-                keyPath = currentHost.keyPath
+                host = host.host,
+                port = host.port,
+                username = host.username,
+                password = host.password,
+                keyPath = host.keyPath
             )
-            
+
             // Update last connected time
-            hostRepository.updateHost(currentHost.copy(lastConnected = System.currentTimeMillis()))
-            
+            hostRepository.updateHost(host.copy(lastConnected = System.currentTimeMillis()))
+
             _connectionState.value = ConnectionState.Connected(
                 sessionId = UUID.randomUUID().toString()
             )
@@ -69,7 +72,6 @@ sealed class ConnectionState {
     data class Error(val message: String) : ConnectionState()
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ConnectionScreen(
     hostId: String,
@@ -90,84 +92,26 @@ fun ConnectionScreen(
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Connect") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
+    // Show connecting screen
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            CircularProgressIndicator()
+            Text(
+                text = when (connectionState) {
+                    is ConnectionState.Connecting -> "Connecting to ${host?.host ?: ""}..."
+                    is ConnectionState.Error -> "Connection failed"
+                    else -> "Loading..."
                 }
             )
-        }
-    ) { paddingValues ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-                .padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            host?.let { currentHost ->
-                Card(
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text(
-                            text = currentHost.name,
-                            style = MaterialTheme.typography.headlineSmall
-                        )
-                        Text(
-                            text = "${currentHost.username}@${currentHost.host}:${currentHost.port}",
-                            style = MaterialTheme.typography.bodyLarge
-                        )
-                        if (currentHost.kittyEnabled) {
-                            Text(
-                                text = "Kitty Image Protocol: Enabled",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                when (connectionState) {
-                    is ConnectionState.Idle -> {
-                        Button(
-                            onClick = { viewModel.connect() },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Connect")
-                        }
-                    }
-                    is ConnectionState.Connecting -> {
-                        CircularProgressIndicator()
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text("Connecting...")
-                    }
-                    is ConnectionState.Error -> {
-                        Text(
-                            text = (connectionState as ConnectionState.Error).message,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Button(
-                            onClick = { viewModel.connect() },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text("Retry")
-                        }
-                    }
-                    is ConnectionState.Connected -> {
-                        // Navigation will handle this
-                    }
+            if (connectionState is ConnectionState.Error) {
+                TextButton(onClick = { viewModel.connect() }) {
+                    Text("Retry")
                 }
             }
         }

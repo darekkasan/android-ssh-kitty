@@ -1,14 +1,13 @@
 package com.kisshkitty.ui.screens.terminal
 
-import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -16,9 +15,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
@@ -26,7 +26,6 @@ import androidx.lifecycle.viewModelScope
 import com.kisshkitty.core.kitty.KittyImage
 import com.kisshkitty.core.kitty.KittyImageRenderer
 import com.kisshkitty.core.terminal.TerminalEmulator
-import com.kisshkitty.core.terminal.TerminalRenderer
 import com.kisshkitty.core.ssh.SshConnectionManager
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
@@ -59,8 +58,6 @@ class TerminalViewModel @Inject constructor(
 
     private val terminalEmulator = TerminalEmulator()
     private val kittyRenderer = KittyImageRenderer()
-    private val terminalRenderer = TerminalRenderer()
-
     private var readingJob: kotlinx.coroutines.Job? = null
 
     fun connect(config: com.kisshkitty.core.ssh.SshConfig) {
@@ -89,31 +86,24 @@ class TerminalViewModel @Inject constructor(
                     val text = String(data)
                     processTerminalOutput(text)
                 }
-                delay(16) // ~60fps
+                delay(16)
             }
             _terminalState.value = TerminalState.Disconnected
         }
     }
 
     private fun processTerminalOutput(text: String) {
-        // Check for Kitty graphics sequences
         if (kittyRenderer.getParser().containsKittySequence(text)) {
             val output = kittyRenderer.processOutput(text)
-            
-            // Process text portion
             terminalEmulator.processOutput(output.text)
-            
-            // Update Kitty images
             val newImages = output.images.map { it.image }
             if (newImages.isNotEmpty()) {
                 _kittyImages.value = _kittyImages.value + newImages
             }
         } else {
-            // Regular terminal output
             terminalEmulator.processOutput(text)
         }
 
-        // Update state
         _terminalBuffer.value = terminalEmulator.getBuffer()
         _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
         _terminalColors.value = terminalEmulator.getColors()
@@ -188,8 +178,8 @@ fun TerminalScreen(
     val terminalColors by viewModel.terminalColors.collectAsState()
     val kittyImages by viewModel.kittyImages.collectAsState()
 
-    var showKeyboard by remember { mutableStateOf(false) }
     var inputText by remember { mutableStateOf("") }
+    val keyboardController = LocalSoftwareKeyboardController.current
 
     Scaffold(
         topBar = {
@@ -205,9 +195,6 @@ fun TerminalScreen(
                     )
                 },
                 actions = {
-                    IconButton(onClick = { showKeyboard = !showKeyboard }) {
-                        Icon(Icons.Default.Keyboard, contentDescription = "Keyboard")
-                    }
                     IconButton(onClick = {
                         viewModel.disconnect()
                         onDisconnect()
@@ -231,7 +218,7 @@ fun TerminalScreen(
                     .fillMaxWidth()
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
-                            // Handle tap for cursor positioning
+                            keyboardController?.show()
                         }
                     }
             ) {
@@ -244,57 +231,59 @@ fun TerminalScreen(
                 )
             }
 
-            // Input area
-            if (showKeyboard) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    OutlinedTextField(
-                        value = inputText,
-                        onValueChange = { inputText = it },
-                        modifier = Modifier.weight(1f),
-                        singleLine = true
-                    )
-                    Button(
-                        onClick = {
+            // Input area - always visible
+            OutlinedTextField(
+                value = inputText,
+                onValueChange = { inputText = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp)
+                    .onKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyDown && event.key == Key.Enter) {
                             viewModel.sendInput(inputText + "\r")
                             inputText = ""
+                            true
+                        } else {
+                            false
                         }
-                    ) {
-                        Text("Send")
+                    },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(
+                    onSend = {
+                        viewModel.sendInput(inputText + "\r")
+                        inputText = ""
                     }
-                }
+                ),
+                placeholder = { Text("Type command...", color = Color.Gray) }
+            )
 
-                // Special keys row
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
-                    SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
-                    SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
-                    SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
-                }
+            // Special keys row
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
+                SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
+                SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
+                SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
+            }
 
-                // Arrow keys
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
-                    SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
-                    SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
-                }
+            // Arrow keys
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
+                Spacer(modifier = Modifier.width(8.dp))
+                SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
+                SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
+                SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
             }
         }
     }
@@ -308,14 +297,10 @@ fun TerminalCanvas(
     kittyImages: List<KittyImage>,
     modifier: Modifier = Modifier
 ) {
-    val terminalRenderer = remember { TerminalRenderer() }
-    
     Canvas(modifier = modifier) {
-        // Update renderer dimensions
         val cellWidth = size.width / buffer[0].size
         val cellHeight = size.height / buffer.size
-        terminalRenderer.updateFontSize(cellHeight * 0.8f)
-        
+
         // Draw terminal content
         for (y in buffer.indices) {
             for (x in buffer[y].indices) {
