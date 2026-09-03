@@ -5,7 +5,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
@@ -16,16 +15,11 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -118,20 +112,25 @@ class TerminalViewModel @Inject constructor(
     }
 
     private fun processTerminalOutput(text: String) {
-        if (kittyRenderer.getParser().containsKittySequence(text)) {
-            val output = kittyRenderer.processOutput(text)
-            terminalEmulator.processOutput(output.text)
-            val newImages = output.images.map { it.image }
-            if (newImages.isNotEmpty()) {
-                _kittyImages.value = _kittyImages.value + newImages
+        try {
+            if (kittyRenderer.getParser().containsKittySequence(text)) {
+                val output = kittyRenderer.processOutput(text)
+                terminalEmulator.processOutput(output.text)
+                val newImages = output.images.map { it.image }
+                if (newImages.isNotEmpty()) {
+                    _kittyImages.value = _kittyImages.value + newImages
+                }
+            } else {
+                terminalEmulator.processOutput(text)
             }
-        } else {
-            terminalEmulator.processOutput(text)
-        }
 
-        _terminalBuffer.value = terminalEmulator.getBuffer()
-        _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
-        _terminalColors.value = terminalEmulator.getColors()
+            _terminalBuffer.value = terminalEmulator.getBuffer()
+            _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
+            _terminalColors.value = terminalEmulator.getColors()
+        } catch (e: Exception) {
+            // Log error but don't crash
+            e.printStackTrace()
+        }
     }
 
     fun sendInput(text: String) {
@@ -205,17 +204,20 @@ fun TerminalScreen(
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
-    var inputText by remember { mutableStateOf("") }
 
     // Auto-connect on first load
     LaunchedEffect(hostId) {
         viewModel.connect(hostId)
     }
 
-    // Auto-focus the hidden text field
+    // Auto-focus on connect
     LaunchedEffect(terminalState) {
         if (terminalState is TerminalState.Connected) {
-            focusRequester.requestFocus()
+            try {
+                focusRequester.requestFocus()
+            } catch (e: Exception) {
+                // Ignore focus errors
+            }
         }
     }
 
@@ -250,70 +252,6 @@ fun TerminalScreen(
                 .imePadding()
                 .background(Color.Black)
         ) {
-            // Hidden text field for keyboard input
-            BasicTextField(
-                value = inputText,
-                onValueChange = { newValue ->
-                    // Check if Enter was pressed (newlines)
-                    if (newValue.contains("\n")) {
-                        viewModel.sendInput(inputText + "\n")
-                        inputText = ""
-                    } else {
-                        inputText = newValue
-                    }
-                },
-                modifier = Modifier
-                    .size(0.dp)
-                    .focusRequester(focusRequester)
-                    .onKeyEvent { event ->
-                        if (event.type == KeyEventType.KeyDown) {
-                            when (event.key) {
-                                Key.Enter -> {
-                                    viewModel.sendInput(inputText + "\r")
-                                    inputText = ""
-                                    true
-                                }
-                                Key.Backspace -> {
-                                    if (inputText.isNotEmpty()) {
-                                        inputText = inputText.dropLast(1)
-                                        viewModel.sendInput("\b")
-                                    } else {
-                                        viewModel.sendSpecialKey(SpecialKey.BACKSPACE)
-                                    }
-                                    true
-                                }
-                                Key.DirectionUp -> {
-                                    viewModel.sendSpecialKey(SpecialKey.UP)
-                                    true
-                                }
-                                Key.DirectionDown -> {
-                                    viewModel.sendSpecialKey(SpecialKey.DOWN)
-                                    true
-                                }
-                                Key.DirectionLeft -> {
-                                    viewModel.sendSpecialKey(SpecialKey.LEFT)
-                                    true
-                                }
-                                Key.DirectionRight -> {
-                                    viewModel.sendSpecialKey(SpecialKey.RIGHT)
-                                    true
-                                }
-                                Key.Tab -> {
-                                    viewModel.sendSpecialKey(SpecialKey.TAB)
-                                    true
-                                }
-                                Key.Escape -> {
-                                    viewModel.sendSpecialKey(SpecialKey.ESC)
-                                    true
-                                }
-                                else -> false
-                            }
-                        } else false
-                    },
-                cursorBrush = SolidColor(Color.Transparent),
-                textStyle = TextStyle(color = Color.Transparent)
-            )
-
             // Terminal display
             Box(
                 modifier = Modifier
@@ -411,21 +349,21 @@ fun TerminalCanvas(
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
-    val fontSize = 12.sp
+    val fontSize = 14.sp
     val fontSizePx = with(density) { fontSize.toPx() }
 
     Canvas(modifier = modifier) {
         val cellWidth = size.width / buffer[0].size
         val cellHeight = size.height / buffer.size
 
-        val paint = android.graphics.Paint().apply {
-            color = android.graphics.Color.WHITE
-            textSize = fontSizePx
-            typeface = Typeface.MONOSPACE
-            isAntiAlias = true
-        }
-
         drawIntoCanvas { canvas ->
+            val paint = android.graphics.Paint().apply {
+                color = android.graphics.Color.WHITE
+                textSize = fontSizePx
+                typeface = Typeface.MONOSPACE
+                isAntiAlias = true
+            }
+
             // Draw terminal content
             for (y in buffer.indices) {
                 for (x in buffer[y].indices) {
@@ -436,7 +374,7 @@ fun TerminalCanvas(
                         canvas.nativeCanvas.drawText(
                             char.toString(),
                             x * cellWidth,
-                            (y + 1) * cellHeight - 2f,
+                            (y + 1) * cellHeight - 4f,
                             paint
                         )
                     }
