@@ -322,20 +322,11 @@ fun TerminalCanvas(
                 val char = buffer[y][x]
                 if (char != ' ') {
                     val color = colors[y][x]
-                    drawContext.canvas.nativeCanvas.apply {
-                        val paint = android.graphics.Paint().apply {
-                            this.color = color
-                            textSize = cellHeight * 0.8f
-                            typeface = android.graphics.Typeface.MONOSPACE
-                            isAntiAlias = true
-                        }
-                        drawText(
-                            char.toString(),
-                            x * cellWidth,
-                            (y + 1) * cellHeight - 4,
-                            paint
-                        )
-                    }
+                    drawRect(
+                        color = Color(color),
+                        topLeft = Offset(x * cellWidth, y * cellHeight),
+                        size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight)
+                    )
                 }
             }
         }
