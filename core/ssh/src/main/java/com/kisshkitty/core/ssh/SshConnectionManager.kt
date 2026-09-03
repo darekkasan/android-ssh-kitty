@@ -13,12 +13,13 @@ class SshConnectionManager @Inject constructor() {
 
     private var currentClient: SSHClient? = null
     private var currentSession: Session? = null
-    private var currentShell: Session.Shell? = null
+    private var currentCommand: Session.Command? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
 
     suspend fun connect(config: SshConfig): Result<SshConnection> = try {
-        val client = SSHClient(config.hostKeyVerifier)
+        val client = SSHClient()
+        client.addHostKeyVerifier(config.hostKeyVerifier)
 
         // Configure timeouts
         client.connectTimeout = config.timeout
@@ -38,15 +39,15 @@ class SshConnectionManager @Inject constructor() {
 
         // Open shell session
         val session = client.startSession()
-        val shell = session.exec("bash")
+        val command = session.exec("bash -l")
 
         currentClient = client
         currentSession = session
-        currentShell = shell
-        inputStream = shell.inputStream
-        outputStream = shell.outputStream
+        currentCommand = command
+        inputStream = command.inputStream
+        outputStream = command.outputStream
 
-        Result.success(SshConnection(client, session, shell))
+        Result.success(SshConnection(client, session, command))
     } catch (e: Exception) {
         Result.failure(e)
     }
@@ -70,14 +71,14 @@ class SshConnectionManager @Inject constructor() {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        // PTY resize not supported in exec mode
+        // PTY resize - not available in exec mode
     }
 
     fun disconnect() {
         try {
             inputStream?.close()
             outputStream?.close()
-            currentShell?.close()
+            currentCommand?.close()
             currentSession?.close()
             currentClient?.disconnect()
         } catch (e: Exception) {
@@ -85,7 +86,7 @@ class SshConnectionManager @Inject constructor() {
         } finally {
             currentClient = null
             currentSession = null
-            currentShell = null
+            currentCommand = null
             inputStream = null
             outputStream = null
         }
@@ -109,5 +110,5 @@ data class SshConfig(
 data class SshConnection(
     val client: SSHClient,
     val session: Session,
-    val shell: Session.Shell
+    val command: Session.Command
 )
