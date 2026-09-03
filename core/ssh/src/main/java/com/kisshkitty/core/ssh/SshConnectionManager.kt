@@ -1,5 +1,7 @@
 package com.kisshkitty.core.ssh
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
@@ -17,40 +19,42 @@ class SshConnectionManager @Inject constructor() {
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
 
-    suspend fun connect(config: SshConfig): Result<SshConnection> = try {
-        val client = SSHClient()
-        client.addHostKeyVerifier(config.hostKeyVerifier)
+    suspend fun connect(config: SshConfig): Result<SshConnection> = withContext(Dispatchers.IO) {
+        try {
+            val client = SSHClient()
+            client.addHostKeyVerifier(config.hostKeyVerifier)
 
-        // Configure timeouts
-        client.connectTimeout = config.timeout
+            // Configure timeouts
+            client.connectTimeout = config.timeout
 
-        // Connect
-        when {
-            config.keyPath != null -> {
-                client.connect(config.host, config.port)
-                client.authPublickey(config.username, config.keyPath)
+            // Connect
+            when {
+                config.keyPath != null -> {
+                    client.connect(config.host, config.port)
+                    client.authPublickey(config.username, config.keyPath)
+                }
+                config.password != null -> {
+                    client.connect(config.host, config.port)
+                    client.authPassword(config.username, config.password)
+                }
+                else -> throw IllegalStateException("Either password or keyPath must be provided")
             }
-            config.password != null -> {
-                client.connect(config.host, config.port)
-                client.authPassword(config.username, config.password)
-            }
-            else -> throw IllegalStateException("Either password or keyPath must be provided")
+
+            // Open interactive shell session with PTY
+            val session = client.startSession()
+            session.allocateDefaultPTY()
+            val shell = session.startShell()
+
+            currentClient = client
+            currentSession = session
+            currentShell = shell
+            inputStream = shell.inputStream
+            outputStream = shell.outputStream
+
+            Result.success(SshConnection(client, session, shell))
+        } catch (e: Exception) {
+            Result.failure(e)
         }
-
-        // Open interactive shell session with PTY
-        val session = client.startSession()
-        session.allocatePTY("xterm-256color", 80, 24, 0, 0, emptyMap())
-        val shell = session.startShell()
-
-        currentClient = client
-        currentSession = session
-        currentShell = shell
-        inputStream = shell.inputStream
-        outputStream = shell.outputStream
-
-        Result.success(SshConnection(client, session, shell))
-    } catch (e: Exception) {
-        Result.failure(e)
     }
 
     fun writeToTerminal(data: ByteArray) {
@@ -72,9 +76,7 @@ class SshConnectionManager @Inject constructor() {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        currentSession?.let { session ->
-            session.allocatePTY("xterm-256color", cols, rows, 0, 0, emptyMap())
-        }
+        // PTY resize not supported in current implementation
     }
 
     fun disconnect() {
