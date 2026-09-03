@@ -281,15 +281,17 @@ fun TerminalScreen(
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
-                    if (newValue.endsWith("\n") || newValue.endsWith("\r")) {
-                        // Enter pressed - send accumulated text + newline
-                        viewModel.sendInput(inputText + "\n")
-                        inputText = ""
-                    } else if (newValue.length > inputText.length) {
-                        // Character typed - send only the new character
-                        val newChar = newValue.last()
-                        viewModel.sendInput(newChar.toString())
-                        inputText = newValue
+                    if (newValue.length > inputText.length) {
+                        // Character(s) typed - send only the new character(s)
+                        val newChars = newValue.substring(inputText.length)
+                        // Check if Enter was pressed (newline)
+                        if (newChars.contains("\n")) {
+                            viewModel.sendInput("\r")
+                            inputText = ""
+                        } else {
+                            viewModel.sendInput(newChars)
+                            inputText = newValue
+                        }
                     } else if (newValue.length < inputText.length) {
                         // Backspace pressed
                         viewModel.sendInput("\b")
