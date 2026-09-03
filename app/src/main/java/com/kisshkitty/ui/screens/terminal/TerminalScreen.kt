@@ -218,6 +218,7 @@ fun TerminalScreen(
     // Auto-focus on connect
     LaunchedEffect(terminalState) {
         if (terminalState is TerminalState.Connected) {
+            kotlinx.coroutines.delay(500)
             try {
                 focusRequester.requestFocus()
             } catch (e: Exception) {
