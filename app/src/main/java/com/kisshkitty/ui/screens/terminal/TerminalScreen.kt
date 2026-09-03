@@ -1,21 +1,31 @@
 package com.kisshkitty.ui.screens.terminal
 
+import android.graphics.Typeface
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -24,7 +34,6 @@ import com.kisshkitty.core.kitty.KittyImageRenderer
 import com.kisshkitty.core.terminal.TerminalEmulator
 import com.kisshkitty.core.ssh.SshConfig
 import com.kisshkitty.core.ssh.SshConnectionManager
-import com.kisshkitty.data.Host
 import com.kisshkitty.data.HostRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
@@ -193,10 +202,19 @@ fun TerminalScreen(
     val kittyImages by viewModel.kittyImages.collectAsState()
 
     val keyboardController = LocalSoftwareKeyboardController.current
+    val focusRequester = remember { FocusRequester() }
+    var inputText by remember { mutableStateOf("") }
 
     // Auto-connect on first load
     LaunchedEffect(hostId) {
         viewModel.connect(hostId)
+    }
+
+    // Auto-focus the hidden text field
+    LaunchedEffect(terminalState) {
+        if (terminalState is TerminalState.Connected) {
+            focusRequester.requestFocus()
+        }
     }
 
     Scaffold(
@@ -227,14 +245,80 @@ fun TerminalScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
+                .imePadding()
                 .background(Color.Black)
         ) {
+            // Hidden text field for keyboard input
+            BasicTextField(
+                value = inputText,
+                onValueChange = { newValue ->
+                    // Check if Enter was pressed (newlines)
+                    if (newValue.contains("\n")) {
+                        viewModel.sendInput(inputText + "\n")
+                        inputText = ""
+                    } else {
+                        inputText = newValue
+                    }
+                },
+                modifier = Modifier
+                    .size(0.dp)
+                    .focusRequester(focusRequester)
+                    .onKeyEvent { event ->
+                        if (event.type == KeyEventType.KeyDown) {
+                            when (event.key) {
+                                Key.Enter -> {
+                                    viewModel.sendInput(inputText + "\r")
+                                    inputText = ""
+                                    true
+                                }
+                                Key.Backspace -> {
+                                    if (inputText.isNotEmpty()) {
+                                        inputText = inputText.dropLast(1)
+                                        viewModel.sendInput("\b")
+                                    } else {
+                                        viewModel.sendSpecialKey(SpecialKey.BACKSPACE)
+                                    }
+                                    true
+                                }
+                                Key.DirectionUp -> {
+                                    viewModel.sendSpecialKey(SpecialKey.UP)
+                                    true
+                                }
+                                Key.DirectionDown -> {
+                                    viewModel.sendSpecialKey(SpecialKey.DOWN)
+                                    true
+                                }
+                                Key.DirectionLeft -> {
+                                    viewModel.sendSpecialKey(SpecialKey.LEFT)
+                                    true
+                                }
+                                Key.DirectionRight -> {
+                                    viewModel.sendSpecialKey(SpecialKey.RIGHT)
+                                    true
+                                }
+                                Key.Tab -> {
+                                    viewModel.sendSpecialKey(SpecialKey.TAB)
+                                    true
+                                }
+                                Key.Escape -> {
+                                    viewModel.sendSpecialKey(SpecialKey.ESC)
+                                    true
+                                }
+                                else -> false
+                            }
+                        } else false
+                    },
+                cursorBrush = SolidColor(Color.Transparent),
+                textStyle = TextStyle(color = Color.Transparent)
+            )
+
             // Terminal display
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
+                            focusRequester.requestFocus()
                             keyboardController?.show()
                         }
                     }
@@ -324,9 +408,20 @@ fun TerminalCanvas(
     kittyImages: List<KittyImage>,
     modifier: Modifier = Modifier
 ) {
+    val density = LocalDensity.current
+    val fontSize = 12.sp
+    val fontSizePx = with(density) { fontSize.toPx() }
+
     Canvas(modifier = modifier) {
         val cellWidth = size.width / buffer[0].size
         val cellHeight = size.height / buffer.size
+
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE
+            textSize = fontSizePx
+            typeface = Typeface.MONOSPACE
+            isAntiAlias = true
+        }
 
         // Draw terminal content
         for (y in buffer.indices) {
@@ -334,10 +429,12 @@ fun TerminalCanvas(
                 val char = buffer[y][x]
                 if (char != ' ') {
                     val color = colors[y][x]
-                    drawRect(
-                        color = Color(color),
-                        topLeft = Offset(x * cellWidth, y * cellHeight),
-                        size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight)
+                    paint.color = color
+                    drawContext.canvas.nativeCanvas.drawText(
+                        char.toString(),
+                        x * cellWidth,
+                        (y + 1) * cellHeight - 2f,
+                        paint
                     )
                 }
             }
