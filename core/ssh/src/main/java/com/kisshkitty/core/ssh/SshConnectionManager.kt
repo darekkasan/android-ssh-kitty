@@ -1,12 +1,15 @@
 package com.kisshkitty.core.ssh
 
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
+import net.schmizz.sshj.common.SecurityUtils
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import java.io.InputStream
 import java.io.OutputStream
+import java.security.Security
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -18,6 +21,30 @@ class SshConnectionManager @Inject constructor() {
     private var currentShell: Session.Shell? = null
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
+
+    init {
+        // Fix for Android: replace Android's BC provider with Java's BC provider
+        // Android's BC doesn't support X25519 which sshj needs
+        fixBouncyCastle()
+    }
+
+    private fun fixBouncyCastle() {
+        try {
+            // Remove Android's BC provider
+            val androidBC = Security.getProvider("BC")
+            if (androidBC != null) {
+                Security.removeProvider("BC")
+            }
+
+            // Try to add Java's BC provider if available
+            // sshj will use its own bundled BC if available
+            SecurityUtils.setRegisterBouncyCastle(true)
+
+            Log.d("SshConnectionManager", "BouncyCastle provider fixed for Android")
+        } catch (e: Exception) {
+            Log.e("SshConnectionManager", "Failed to fix BouncyCastle: ${e.message}")
+        }
+    }
 
     suspend fun connect(config: SshConfig): Result<SshConnection> = withContext(Dispatchers.IO) {
         try {
@@ -53,6 +80,7 @@ class SshConnectionManager @Inject constructor() {
 
             Result.success(SshConnection(client, session, shell))
         } catch (e: Exception) {
+            Log.e("SshConnectionManager", "SSH connection failed", e)
             Result.failure(e)
         }
     }
