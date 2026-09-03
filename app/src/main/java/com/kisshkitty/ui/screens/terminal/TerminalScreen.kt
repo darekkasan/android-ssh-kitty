@@ -18,6 +18,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -423,19 +425,21 @@ fun TerminalCanvas(
             isAntiAlias = true
         }
 
-        // Draw terminal content
-        for (y in buffer.indices) {
-            for (x in buffer[y].indices) {
-                val char = buffer[y][x]
-                if (char != ' ') {
-                    val color = colors[y][x]
-                    paint.color = color
-                    drawContext.canvas.nativeCanvas.drawText(
-                        char.toString(),
-                        x * cellWidth,
-                        (y + 1) * cellHeight - 2f,
-                        paint
-                    )
+        drawIntoCanvas { canvas ->
+            // Draw terminal content
+            for (y in buffer.indices) {
+                for (x in buffer[y].indices) {
+                    val char = buffer[y][x]
+                    if (char != ' ') {
+                        val color = colors[y][x]
+                        paint.color = color
+                        canvas.nativeCanvas.drawText(
+                            char.toString(),
+                            x * cellWidth,
+                            (y + 1) * cellHeight - 2f,
+                            paint
+                        )
+                    }
                 }
             }
         }
