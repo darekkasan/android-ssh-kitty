@@ -40,6 +40,18 @@ class HostListViewModel @Inject constructor(
         }
     }
 
+    fun addHost(host: Host) {
+        viewModelScope.launch {
+            hostRepository.addHost(host)
+        }
+    }
+
+    fun updateHost(host: Host) {
+        viewModelScope.launch {
+            hostRepository.updateHost(host)
+        }
+    }
+
     fun deleteHost(host: Host) {
         viewModelScope.launch {
             hostRepository.deleteHost(host)
@@ -112,7 +124,7 @@ fun HostListScreen(
         AddEditHostDialog(
             onDismiss = { showAddDialog = false },
             onSave = { host ->
-                viewModel.hostRepository.addHost(host)
+                viewModel.addHost(host)
                 showAddDialog = false
             }
         )
@@ -123,7 +135,7 @@ fun HostListScreen(
             host = host,
             onDismiss = { editingHost = null },
             onSave = { updatedHost ->
-                viewModel.hostRepository.updateHost(updatedHost)
+                viewModel.updateHost(updatedHost)
                 editingHost = null
             }
         )

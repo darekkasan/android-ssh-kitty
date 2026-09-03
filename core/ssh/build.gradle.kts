@@ -25,7 +25,7 @@ android {
 
 dependencies {
     // SSHJ
-    implementation("com.hierynomus:sshj:0.39.0")
+    api("com.hierynomus:sshj:0.39.0")
     implementation("org.bouncycastle:bcprov-jdk18on:1.79")
 
     // Coroutines

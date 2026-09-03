@@ -222,7 +222,7 @@ fun TerminalScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
-                .background(android.graphics.Color.BLACK)
+                .background(Color.Black)
         ) {
             // Terminal display
             Box(
