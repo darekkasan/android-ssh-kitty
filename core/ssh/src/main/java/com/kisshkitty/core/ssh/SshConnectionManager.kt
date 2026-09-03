@@ -38,8 +38,7 @@ class SshConnectionManager @Inject constructor() {
 
         // Open shell session
         val session = client.startSession()
-        session.allocateDefaultPty()
-        val shell = session.openShell()
+        val shell = session.exec("bash")
 
         currentClient = client
         currentSession = session
@@ -71,9 +70,7 @@ class SshConnectionManager @Inject constructor() {
     }
 
     fun resizeTerminal(cols: Int, rows: Int) {
-        currentSession?.let { session ->
-            session.allocatePty("xterm-256color", cols, rows, 0, 0)
-        }
+        // PTY resize not supported in exec mode
     }
 
     fun disconnect() {
