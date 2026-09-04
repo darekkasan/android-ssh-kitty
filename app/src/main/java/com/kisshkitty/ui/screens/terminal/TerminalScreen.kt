@@ -247,7 +247,7 @@ private val TERMINAL_FONT_SIZE = 14.sp
 // Sentinel kept in the hidden input field so the keyboard Backspace key
 // always has something to delete (an empty field produces no event).
 // U+FEFF is invisible and is never sent: diffs only send the suffix.
-private const val INPUT_SENTINEL = "﻿"
+private const val INPUT_SENTINEL = "\uFEFF"
 
 private data class CellMetrics(
     val textSizePx: Float,
