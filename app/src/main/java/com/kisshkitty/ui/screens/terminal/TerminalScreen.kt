@@ -4,6 +4,7 @@ import android.graphics.Typeface
 import android.widget.Toast
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -57,6 +58,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 import javax.inject.Inject
 
 @HiltViewModel
@@ -68,24 +70,23 @@ class TerminalViewModel @Inject constructor(
     private val _terminalState = MutableStateFlow<TerminalState>(TerminalState.Disconnected)
     val terminalState: StateFlow<TerminalState> = _terminalState
 
-    private val _terminalBuffer = MutableStateFlow(Array(24) { CharArray(80) { ' ' } })
-    val terminalBuffer: StateFlow<Array<CharArray>> = _terminalBuffer
-
-    private val _cursorPosition = MutableStateFlow(Pair(0, 0))
-    val cursorPosition: StateFlow<Pair<Int, Int>> = _cursorPosition
-
-    private val _terminalColors = MutableStateFlow(Array(24) { IntArray(80) { android.graphics.Color.WHITE } })
-    val terminalColors: StateFlow<Array<IntArray>> = _terminalColors
-
-    private val _kittyImages = MutableStateFlow<List<KittyImage>>(emptyList())
-    val kittyImages: StateFlow<List<KittyImage>> = _kittyImages
-
     private val terminalEmulator = TerminalEmulator()
     private val kittyRenderer = KittyImageRenderer()
     private var readingJob: kotlinx.coroutines.Job? = null
-    // Raw bytes not yet processed. Incomplete trailing Kitty sequences
-    // stay here until the rest arrives.
+
+    private val _viewport = MutableStateFlow(terminalEmulator.getWindow(0))
+    val viewport: StateFlow<TerminalEmulator.EmulatorWindow> = _viewport
+
+    private val _placedImages = MutableStateFlow<List<PlacedImage>>(emptyList())
+    val placedImages: StateFlow<List<PlacedImage>> = _placedImages
+
+    private var viewportOffset = 0
+    // Raw output not yet processed. An incomplete trailing escape stays
+    // here until the rest arrives.
     private var pendingRaw = StringBuilder()
+    // Cell metrics (px) reported by the UI for image cell resolution.
+    private var cellW = 10f
+    private var cellH = 20f
 
     fun connect(hostId: String) {
         viewModelScope.launch {
@@ -136,43 +137,179 @@ class TerminalViewModel @Inject constructor(
     private fun processTerminalOutput(text: String) {
         try {
             pendingRaw.append(text)
-            var raw = pendingRaw.toString()
-            // A Kitty APC sequence can be split across reads. Hold back a
-            // trailing unterminated sequence until the rest arrives.
-            // (Cap the hold-back so garbage can never grow unbounded.)
-            var holdBack = ""
-            val start = raw.lastIndexOf(KittyProtocolParser.APC_START)
-            val end = raw.lastIndexOf(KittyProtocolParser.APC_END)
-            if (start != -1 && start > end) {
-                if (raw.length - start > 2_000_000) {
-                    // Too long to be a real sequence: flush it as text.
-                } else {
-                    holdBack = raw.substring(start)
-                    raw = raw.substring(0, start)
+            val (complete, rest) = splitCompleteEscape(pendingRaw.toString())
+            // Cap the hold-back so an abandoned escape can never grow
+            // unbounded: flush it as plain text.
+            pendingRaw = if (rest.length > 1_000_000) {
+                StringBuilder()
+            } else {
+                StringBuilder(rest)
+            }
+            val raw = if (rest.length > 1_000_000) complete + rest else complete
+            if (raw.isEmpty()) return
+            for (event in kittyRenderer.processOutput(raw).events) {
+                when (event) {
+                    is KittyImageRenderer.OutputEvent.Text ->
+                        terminalEmulator.processOutput(event.text)
+                    is KittyImageRenderer.OutputEvent.Show ->
+                        showImage(event.image, event.op)
+                    is KittyImageRenderer.OutputEvent.Delete ->
+                        applyDelete(event.selector)
+                    is KittyImageRenderer.OutputEvent.Respond ->
+                        sendInput(event.payload)
                 }
             }
-            if (raw.isNotEmpty()) {
-                if (kittyRenderer.getParser().containsKittySequence(raw)) {
-                    val output = kittyRenderer.processOutput(raw)
-                    terminalEmulator.processOutput(output.text)
-                    val newImages = output.images.map { it.image }
-                    if (newImages.isNotEmpty()) {
-                        _kittyImages.value = _kittyImages.value + newImages
-                    }
-                } else {
-                    terminalEmulator.processOutput(raw)
-                }
-
-                _terminalBuffer.value = terminalEmulator.getBuffer()
-                _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
-                _terminalColors.value = terminalEmulator.getColors()
-            }
-            pendingRaw = StringBuilder(holdBack)
+            refreshViewport()
         } catch (e: Exception) {
             // Log error but don't crash
             e.printStackTrace()
         }
     }
+
+    /**
+     * Split raw output into a complete prefix and a trailing incomplete
+     * escape sequence (CSI/OSC/DCS/APC/etc. split across reads).
+     */
+    private fun splitCompleteEscape(raw: String): Pair<String, String> {
+        val esc = raw.lastIndexOf('\u001B')
+        if (esc == -1) return raw to ""
+        val tail = raw.substring(esc)
+        return if (isCompleteEscape(tail)) raw to ""
+        else raw.substring(0, esc) to tail
+    }
+
+    private fun isCompleteEscape(tail: String): Boolean {
+        if (tail.length < 2) return false
+        return when (tail[1]) {
+            '[' -> {
+                var i = 2
+                while (i < tail.length && tail[i] in '0'..'?') i++
+                while (i < tail.length && tail[i] in ' '..'/') i++
+                i < tail.length
+            }
+            ']', 'P', 'X', '^', '_' ->
+                tail.contains('\u0007') || tail.contains("\u001B\\")
+            '#', '(', ')', '%', '&' -> tail.length >= 3
+            else -> true
+        }
+    }
+
+    private fun showImage(image: KittyImage, op: KittyProtocolParser.ShowOp) {
+        val anchorCol = terminalEmulator.getCursorX()
+        val anchorLine = terminalEmulator.getScrollbackSize() + terminalEmulator.getCursorY()
+        val bitmap = try {
+            cropBitmap(image.bitmap, op)
+        } catch (e: Exception) {
+            null
+        } ?: return
+        val (placeCols, placeRows) = resolveCells(op, bitmap.width, bitmap.height)
+        val placed = PlacedImage(
+            imageId = image.id,
+            bitmap = bitmap,
+            col = anchorCol,
+            absLine = anchorLine,
+            cCells = placeCols,
+            rCells = placeRows,
+            xOffPx = op.xOffPx,
+            yOffPx = op.yOffPx,
+            zIndex = op.zIndex
+        )
+        _placedImages.value = (_placedImages.value + placed).takeLast(MAX_PLACED_IMAGES)
+        if (!op.noCursorMove) {
+            terminalEmulator.advanceForImage(placeCols, placeRows)
+        }
+    }
+
+    private fun cropBitmap(
+        src: android.graphics.Bitmap,
+        op: KittyProtocolParser.ShowOp
+    ): android.graphics.Bitmap {
+        if (op.srcW <= 0 || op.srcH <= 0) return src
+        val x = op.srcX.coerceIn(0, (src.width - 1).coerceAtLeast(0))
+        val y = op.srcY.coerceIn(0, (src.height - 1).coerceAtLeast(0))
+        val w = op.srcW.coerceIn(1, src.width - x)
+        val h = op.srcH.coerceIn(1, src.height - y)
+        if (w <= 0 || h <= 0) return src
+        return android.graphics.Bitmap.createBitmap(src, x, y, w, h)
+    }
+
+    /** Resolve placement cells (spec: missing c/r derives from aspect). */
+    private fun resolveCells(
+        op: KittyProtocolParser.ShowOp,
+        bmpW: Int,
+        bmpH: Int
+    ): Pair<Int, Int> {
+        val w = bmpW.coerceAtLeast(1)
+        val h = bmpH.coerceAtLeast(1)
+        val cw = cellW.coerceAtLeast(1f)
+        val ch = cellH.coerceAtLeast(1f)
+        return when {
+            op.destCols > 0 && op.destRows > 0 -> op.destCols to op.destRows
+            op.destCols > 0 -> op.destCols to
+                (op.destCols * cw * h / (w * ch)).roundToInt().coerceAtLeast(1)
+            op.destRows > 0 ->
+                (op.destRows * ch * w / (h * cw)).roundToInt().coerceAtLeast(1) to op.destRows
+            else -> (w / cw).roundToInt().coerceAtLeast(1) to
+                (h / ch).roundToInt().coerceAtLeast(1)
+        }
+    }
+
+    private fun applyDelete(selector: KittyProtocolParser.DeleteSelector) {
+        val parser = kittyRenderer.getParser()
+        val cursorCol = terminalEmulator.getCursorX() + 1 // 1-based cells
+        val cursorLine = terminalEmulator.getScrollbackSize() +
+            terminalEmulator.getCursorY() + 1
+
+        // Resolve "newest with number" to a concrete id first.
+        var sel = selector
+        if (sel.kind == 'n') {
+            val newest = parser.newestIdForNumber(sel.number) ?: return
+            sel = sel.copy(kind = 'i', imageId = newest)
+        }
+
+        fun cellMatch(p: PlacedImage, x1: Int, y1: Int): Boolean {
+            return x1 in (p.col + 1)..(p.col + p.cCells) &&
+                y1 in (p.absLine + 1)..(p.absLine + p.rCells)
+        }
+
+        val kept = _placedImages.value.filterNot { p ->
+            when (sel.kind) {
+                'a' -> true
+                'i' -> p.imageId == sel.imageId
+                'c' -> cellMatch(p, cursorCol, cursorLine)
+                'p' -> cellMatch(p, sel.x, sel.y)
+                'q' -> cellMatch(p, sel.x, sel.y) && p.zIndex == sel.z
+                'x' -> sel.x in (p.col + 1)..(p.col + p.cCells)
+                'y' -> sel.y in (p.absLine + 1)..(p.absLine + p.rCells)
+                'z' -> p.zIndex == sel.z
+                'r' -> p.imageId in sel.x..sel.y
+                else -> false // frames and unknown selectors: no-op
+            }
+        }
+        _placedImages.value = kept
+        if (sel.freeData) {
+            parser.freeUnreferenced(kept.map { it.imageId }.toSet())
+        }
+    }
+
+    private fun refreshViewport() {
+        val total = terminalEmulator.getScrollbackSize() + terminalEmulator.getRows()
+        val maxOff = (total - terminalEmulator.getRows()).coerceAtLeast(0)
+        viewportOffset = viewportOffset.coerceIn(0, maxOff)
+        _viewport.value = terminalEmulator.getWindow(viewportOffset)
+    }
+
+    fun setViewportOffset(offset: Int) {
+        viewportOffset = offset
+        refreshViewport()
+    }
+
+    fun setCellMetrics(charWidthPx: Float, lineHeightPx: Float) {
+        cellW = charWidthPx
+        cellH = lineHeightPx
+    }
+
+    fun isBracketedPaste(): Boolean = terminalEmulator.bracketedPaste
 
     fun sendInput(text: String) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -201,11 +338,6 @@ class TerminalViewModel @Inject constructor(
         sendInput(String(bytes))
     }
 
-    fun resize(cols: Int, rows: Int) {
-        terminalEmulator.resize(cols, rows)
-        sshConnectionManager.resizeTerminal(cols, rows)
-    }
-
     fun disconnect() {
         readingJob?.cancel()
         sshConnectionManager.disconnect()
@@ -216,9 +348,7 @@ class TerminalViewModel @Inject constructor(
         if (cols != terminalEmulator.getCols() || rows != terminalEmulator.getRows()) {
             terminalEmulator.resize(cols, rows)
             sshConnectionManager.resizeTerminal(cols, rows)
-            _terminalBuffer.value = terminalEmulator.getBuffer()
-            _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
-            _terminalColors.value = terminalEmulator.getColors()
+            refreshViewport()
         }
     }
 
@@ -256,6 +386,21 @@ private data class CellMetrics(
     val baselineOffset: Float
 )
 
+/** An image anchored to an absolute terminal line. */
+data class PlacedImage(
+    val imageId: Int,
+    val bitmap: android.graphics.Bitmap,
+    val col: Int,
+    val absLine: Int,
+    val cCells: Int,
+    val rCells: Int,
+    val xOffPx: Int,
+    val yOffPx: Int,
+    val zIndex: Int
+)
+
+private const val MAX_PLACED_IMAGES = 24
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TerminalScreen(
@@ -264,10 +409,8 @@ fun TerminalScreen(
     viewModel: TerminalViewModel = hiltViewModel()
 ) {
     val terminalState by viewModel.terminalState.collectAsState()
-    val terminalBuffer by viewModel.terminalBuffer.collectAsState()
-    val cursorPosition by viewModel.cursorPosition.collectAsState()
-    val terminalColors by viewModel.terminalColors.collectAsState()
-    val kittyImages by viewModel.kittyImages.collectAsState()
+    val viewport by viewModel.viewport.collectAsState()
+    val placedImages by viewModel.placedImages.collectAsState()
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
@@ -294,8 +437,13 @@ fun TerminalScreen(
         )
     }
 
-    val terminalCols = if (terminalBuffer.isNotEmpty()) terminalBuffer[0].size else 80
-    val terminalRows = terminalBuffer.size.coerceAtLeast(1)
+    val terminalCols = if (viewport.chars.isNotEmpty()) viewport.chars[0].size else 80
+    val terminalRows = viewport.chars.size.coerceAtLeast(1)
+
+    // Report metrics for image cell resolution, then fit the grid.
+    LaunchedEffect(cellMetrics) {
+        viewModel.setCellMetrics(cellMetrics.charWidth, cellMetrics.lineHeight)
+    }
 
     fun cellOf(offset: Offset): Pair<Int, Int> {
         val x = (offset.x / cellMetrics.charWidth).toInt()
@@ -316,7 +464,7 @@ fun TerminalScreen(
         }
         return buildString {
             for (y in sy..ey) {
-                val row = terminalBuffer.getOrNull(y) ?: continue
+                val row = viewport.chars.getOrNull(y) ?: continue
                 val fromX = if (y == sy) sx.coerceIn(0, row.size) else 0
                 val toX = if (y == ey) ex.coerceIn(0, row.size) else row.size
                 if (fromX < toX && fromX < row.size) {
@@ -376,9 +524,9 @@ fun TerminalScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                .background(Color.Black)
                 .padding(paddingValues)
                 .imePadding()
-                .background(Color.Black)
         ) {
             // Terminal display
             Box(
@@ -423,16 +571,33 @@ fun TerminalScreen(
                     }
             ) {
                 TerminalCanvas(
-                    buffer = terminalBuffer,
-                    colors = terminalColors,
-                    cursorPosition = cursorPosition,
-                    kittyImages = kittyImages,
+                    buffer = viewport.chars,
+                    colors = viewport.fg,
+                    bgColors = viewport.bg,
+                    cursorPosition = viewport.cursorX to viewport.cursorY,
+                    placedImages = placedImages,
+                    windowStartLine = viewport.windowStart,
                     selection = selection,
                     textSizePx = cellMetrics.textSizePx,
                     cellWidth = cellMetrics.charWidth,
                     cellHeight = cellMetrics.lineHeight,
                     baselineOffset = cellMetrics.baselineOffset,
                     modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            // Scrollbar (only when there is scrollback to show).
+            if (viewport.maxOffset > 0) {
+                ScrollStrip(
+                    offset = viewport.offset,
+                    maxOffset = viewport.maxOffset,
+                    visibleFraction = viewport.chars.size.toFloat() /
+                        viewport.totalLines.toFloat().coerceAtLeast(1f),
+                    onScrollTo = { viewModel.setViewportOffset(it); selection = null },
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .fillMaxHeight()
+                        .width(20.dp)
                 )
             }
 
@@ -516,6 +681,17 @@ fun TerminalScreen(
                     ) {
                         SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
                         SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
+                        SpecialKeyButton("Paste") {
+                            val clip = clipboard.getText()?.text ?: ""
+                            if (clip.isNotEmpty()) {
+                                val text = if (viewModel.isBracketedPaste()) {
+                                    "\u001B[200~$clip\u001B[201~"
+                                } else {
+                                    clip
+                                }
+                                viewModel.sendInput(text)
+                            }
+                        }
                         SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
                         SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
                     }
@@ -536,8 +712,18 @@ fun TerminalScreen(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
+                    // Jump back to the live view when scrolled up.
+                    if (viewport.offset > 0) {
+                        SmallFloatingActionButton(
+                            onClick = { viewModel.setViewportOffset(0); selection = null }
+                        ) {
+                            Text("↓")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
                     SmallFloatingActionButton(
                         onClick = { showKeys = !showKeys }
                     ) {
@@ -587,8 +773,10 @@ fun TerminalScreen(
 fun TerminalCanvas(
     buffer: Array<CharArray>,
     colors: Array<IntArray>,
+    bgColors: Array<IntArray>,
     cursorPosition: Pair<Int, Int>,
-    kittyImages: List<KittyImage>,
+    placedImages: List<PlacedImage>,
+    windowStartLine: Int,
     selection: Pair<Pair<Int, Int>, Pair<Int, Int>>?,
     textSizePx: Float,
     cellWidth: Float,
@@ -599,6 +787,56 @@ fun TerminalCanvas(
     Canvas(modifier = modifier) {
         if (buffer.isEmpty() || buffer[0].isEmpty()) return@Canvas
         val cols = buffer[0].size
+
+        fun drawPlaced(p: PlacedImage) {
+            val bw = p.bitmap.width
+            val bh = p.bitmap.height
+            if (bw <= 0 || bh <= 0) return
+            val viewRow = p.absLine - windowStartLine
+            val dstW = (p.cCells * cellWidth).coerceAtLeast(1f)
+            val dstH = (p.rCells * cellHeight).coerceAtLeast(1f)
+            drawImage(
+                image = p.bitmap.asImageBitmap(),
+                dstOffset = androidx.compose.ui.unit.IntOffset(
+                    (p.col * cellWidth + p.xOffPx).toInt(),
+                    (viewRow * cellHeight + p.yOffPx).toInt()
+                ),
+                dstSize = IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1))
+            )
+        }
+
+        // Images with negative z-index go under the text.
+        for (p in placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))) {
+            if (p.zIndex < 0) drawPlaced(p)
+        }
+
+        // Background fills.
+        for (y in buffer.indices) {
+            val bgRow = bgColors.getOrNull(y) ?: continue
+            var x = 0
+            while (x < buffer[y].size) {
+                val bg = bgRow.getOrNull(x) ?: android.graphics.Color.BLACK
+                if (bg != android.graphics.Color.BLACK) {
+                    var x2 = x
+                    while (x2 < buffer[y].size &&
+                        (bgRow.getOrNull(x2) ?: android.graphics.Color.BLACK) == bg
+                    ) {
+                        x2++
+                    }
+                    drawRect(
+                        color = Color(bg),
+                        topLeft = Offset(x * cellWidth, y * cellHeight),
+                        size = androidx.compose.ui.geometry.Size(
+                            (x2 - x) * cellWidth,
+                            cellHeight
+                        )
+                    )
+                    x = x2
+                } else {
+                    x++
+                }
+            }
+        }
 
         drawIntoCanvas { canvas ->
             val paint = android.graphics.Paint().apply {
@@ -652,30 +890,81 @@ fun TerminalCanvas(
             }
         }
 
-        // Draw cursor
+        // Draw cursor (-1 hides it: scrolled away or cursor hidden).
         val cursorX = cursorPosition.first.coerceIn(0, (cols - 1).coerceAtLeast(0))
-        val cursorY = cursorPosition.second.coerceIn(0, (buffer.size - 1).coerceAtLeast(0))
-        drawRect(
-            color = Color.White,
-            topLeft = Offset(cursorX * cellWidth, cursorY * cellHeight),
-            size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight),
-            alpha = 0.5f
-        )
+        val cursorY = cursorPosition.second
+        if (cursorY in buffer.indices) {
+            drawRect(
+                color = Color.White,
+                topLeft = Offset(cursorX * cellWidth, cursorY * cellHeight),
+                size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight),
+                alpha = 0.5f
+            )
+        }
 
-        // Draw Kitty images, scaled to fit the screen
-        for (image in kittyImages) {
-            val bw = image.bitmap.width
-            val bh = image.bitmap.height
-            if (bw > 0 && bh > 0) {
-                val scale = minOf(size.width / bw, size.height / bh).coerceIn(0.1f, 4f)
-                drawImage(
-                    image = image.bitmap.asImageBitmap(),
-                    dstSize = IntSize(
-                        (bw * scale).toInt().coerceAtLeast(1),
-                        (bh * scale).toInt().coerceAtLeast(1)
-                    )
+        // Images with non-negative z-index go over the text.
+        for (p in placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))) {
+            if (p.zIndex >= 0) drawPlaced(p)
+        }
+    }
+}
+
+@Composable
+fun ScrollStrip(
+    offset: Int,
+    maxOffset: Int,
+    visibleFraction: Float,
+    onScrollTo: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var stripHeight by remember { mutableStateOf(0) }
+    val thumbFraction = visibleFraction.coerceIn(0.05f, 1f)
+    val thumbPos = if (maxOffset == 0) 0f else offset.toFloat() / maxOffset.toFloat()
+
+    Box(
+        modifier = modifier
+            .onSizeChanged { stripHeight = it.height }
+            .pointerInput(maxOffset) {
+                detectTapGestures { offsetPos ->
+                    if (stripHeight > 0) {
+                        val frac = (offsetPos.y / stripHeight).coerceIn(0f, 1f)
+                        onScrollTo(((1f - frac) * maxOffset).toInt().coerceIn(0, maxOffset))
+                    }
+                }
+            }
+            .pointerInput(maxOffset) {
+                detectDragGestures(
+                    onDragStart = { start ->
+                        if (stripHeight > 0) {
+                            val frac = (start.y / stripHeight).coerceIn(0f, 1f)
+                            onScrollTo(((1f - frac) * maxOffset).toInt().coerceIn(0, maxOffset))
+                        }
+                    },
+                    onDrag = { change, _ ->
+                        if (stripHeight > 0) {
+                            val frac = (change.position.y / stripHeight).coerceIn(0f, 1f)
+                            onScrollTo(((1f - frac) * maxOffset).toInt().coerceIn(0, maxOffset))
+                        }
+                    }
                 )
             }
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val trackW = 4.dp.toPx()
+            drawRect(
+                color = Color.White,
+                topLeft = Offset((size.width - trackW) / 2, 0f),
+                size = androidx.compose.ui.geometry.Size(trackW, size.height),
+                alpha = 0.15f
+            )
+            val thumbH = (size.height * thumbFraction).coerceAtLeast(24.dp.toPx())
+            val thumbY = ((size.height - thumbH) * (1f - thumbPos)).coerceIn(0f, size.height - thumbH)
+            drawRect(
+                color = Color.White,
+                topLeft = Offset((size.width - trackW) / 2, thumbY),
+                size = androidx.compose.ui.geometry.Size(trackW, thumbH),
+                alpha = 0.5f
+            )
         }
     }
 }

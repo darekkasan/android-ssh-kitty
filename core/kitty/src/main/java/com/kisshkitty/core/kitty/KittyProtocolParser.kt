@@ -3,15 +3,30 @@ package com.kisshkitty.core.kitty
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.zip.InflaterInputStream
 
 /**
- * Parser for Kitty Graphics Protocol escape sequences.
- * 
- * The Kitty protocol uses APC (Application Programming Command) sequences:
+ * Parser for the Kitty Graphics Protocol.
+ *
+ * Graphics escape codes look like:
  * ESC _ G <control data> ; <payload> ESC \
- * 
+ * where control data is a comma-separated list of key=value pairs and the
+ * payload is base64 encoded image data.
+ *
  * Reference: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+ *
+ * Supported: transmit (a=t), transmit+display (a=T), query (a=q),
+ * put/display (a=p), delete (a=d), chunked uploads (m), zlib (o=z),
+ * direct medium (t=d), ids (i), numbers (I), placements (c/r/x/y/w/h/
+ * X/Y/z/C), virtual placements (U, stored but not rendered),
+ * quiet levels (q=1 no OK, q=2 no responses).
+ *
+ * Not supported: file/shm media (t=f/t/s, answered with an error),
+ * animations (a=f frames are stored as plain images, a=a/a=c ignored),
+ * relative placements (P/Q treated as cursor placements),
+ * Unicode placeholders (U+10EEEE rendering).
  */
 class KittyProtocolParser {
 
@@ -19,135 +34,374 @@ class KittyProtocolParser {
         // APC introducer and terminator
         const val APC_START = "\u001B_"  // ESC _
         const val APC_END = "\u001B\\"    // ESC \
-        
+
         // Image formats
         const val FORMAT_RGB = 24
         const val FORMAT_RGBA = 32
         const val FORMAT_PNG = 100
-        
+
         // Actions
         const val ACTION_TRANSMIT = "t"
         const val ACTION_TRANSMIT_AND_DISPLAY = "T"
         const val ACTION_QUERY = "q"
         const val ACTION_PUT = "p"
         const val ACTION_DELETE = "d"
-        
-        // Transmission media
-        const val MEDIA_DIRECT = "d"
-        const val MEDIA_FILE = "f"
-        const val MEDIA_TEMP = "t"
-        const val MEDIA_SHARED_MEMORY = "s"
+        const val ACTION_FRAME = "f"
+        const val ACTION_ANIMATE = "a"
+        const val ACTION_COMPOSE = "c"
     }
+
+    /** Placement of an image, resolved without pixel metrics. */
+    data class ShowOp(
+        /** Destination cells (0 = auto from aspect, resolved by renderer). */
+        val destCols: Int,
+        val destRows: Int,
+        /** Source rectangle in pixels (0 w/h = full image). */
+        val srcX: Int,
+        val srcY: Int,
+        val srcW: Int,
+        val srcH: Int,
+        /** Origin offset inside the cell, in pixels. */
+        val xOffPx: Int,
+        val yOffPx: Int,
+        val zIndex: Int,
+        val noCursorMove: Boolean
+    )
+
+    /** Delete selector. Coordinates are 1-based like cursor positions. */
+    data class DeleteSelector(
+        /** Normalized lowercase kind: a i n c f p q r x y z. */
+        val kind: Char,
+        val imageId: Int = 0,
+        val placementId: Int = 0,
+        val number: Int = 0,
+        val x: Int = 0,
+        val y: Int = 0,
+        val z: Int = 0,
+        val freeData: Boolean = false,
+        /** Resolve against the cursor position (kind 'c'). */
+        val atCursor: Boolean = false
+    )
+
+    sealed interface KittyEvent {
+        data class Show(val image: KittyImage, val op: ShowOp) : KittyEvent
+        data class Delete(val selector: DeleteSelector) : KittyEvent
+        /** Raw APC payload to write back to the pty. */
+        data class Respond(val payload: String) : KittyEvent
+    }
+
+    private data class PendingUpload(
+        var params: Map<String, String>,
+        val data: ByteArrayOutputStream = ByteArrayOutputStream()
+    )
 
     private val images = mutableMapOf<Int, KittyImage>()
-    private var currentImageId = 0
-    private var currentChunkBuffer = ByteArrayOutputStream()
-    private var isReceivingChunks = false
+    /** Image number -> image ids in creation order (newest last). */
+    private val numbers = mutableMapOf<Int, MutableList<Int>>()
+    private val pending = mutableMapOf<Int, PendingUpload>()
+    private var lastChainId: Int? = null
+    private var nextAutoId = 1
+
+    // ------------------------------------------------------------------
+    // Entry point
+    // ------------------------------------------------------------------
 
     /**
-     * Parse a Kitty graphics escape sequence.
-     * Returns a KittyImage if the sequence is complete, null otherwise.
+     * Parse one complete APC sequence into events.
+     * Returns an empty list while chunked uploads are incomplete.
      */
-    fun parse(sequence: String): KittyImage? {
-        // Check if it's a valid APC sequence
+    fun parse(sequence: String): List<KittyEvent> {
         if (!sequence.startsWith(APC_START) || !sequence.endsWith(APC_END)) {
-            return null
+            return emptyList()
         }
-
-        // Extract the content between APC markers
         val content = sequence.removePrefix(APC_START).removeSuffix(APC_END)
-        
-        // Split into control data and payload
         val separatorIndex = content.indexOf(';')
-        if (separatorIndex == -1) return null
+        if (separatorIndex == -1) return emptyList()
 
-        val controlData = content.substring(0, separatorIndex)
+        val params = parseControlData(content.substring(0, separatorIndex))
         val payload = content.substring(separatorIndex + 1)
 
-        // Parse control data key-value pairs
-        val params = parseControlData(controlData)
-        
-        // Get action
         val action = params["a"] ?: ACTION_TRANSMIT
-        
+        val quiet = params["q"]?.toIntOrNull() ?: 0
+        val hasI = params.containsKey("i")
+        val hasNum = params.containsKey("I")
+
+        if (hasI && hasNum) {
+            return err(quiet, 0, "EINVAL: i and I must not be combined")
+        }
+
         return when (action) {
-            ACTION_TRANSMIT, ACTION_TRANSMIT_AND_DISPLAY -> {
-                handleTransmission(params, payload)
-            }
-            ACTION_QUERY -> {
-                // Query response - we could handle this
-                null
-            }
-            ACTION_PUT -> {
-                // Display a previously transmitted image
-                handlePut(params)
-            }
-            ACTION_DELETE -> {
-                // Delete an image
-                handleDelete(params)
-                null
-            }
-            else -> null
+            ACTION_TRANSMIT, ACTION_TRANSMIT_AND_DISPLAY,
+            ACTION_QUERY, ACTION_FRAME -> handleLoad(params, payload, action, quiet)
+            ACTION_PUT -> handlePut(params, quiet)
+            ACTION_DELETE -> handleDelete(params)
+            // Animation control / compose: parsed, intentionally ignored.
+            ACTION_ANIMATE, ACTION_COMPOSE -> emptyList()
+            else -> emptyList()
         }
     }
 
-    private fun parseControlData(data: String): Map<String, String> {
-        return data.split(",").associate { pair ->
-            val kv = pair.split("=", limit = 2)
-            if (kv.size == 2) kv[0] to kv[1] else kv[0] to ""
+    // ------------------------------------------------------------------
+    // Loading (transmit / query / frames)
+    // ------------------------------------------------------------------
+
+    private fun handleLoad(
+        params: Map<String, String>,
+        payload: String,
+        action: String,
+        quiet: Int
+    ): List<KittyEvent> {
+        val medium = params["t"] ?: "d"
+        if (medium != "d") {
+            val id = params["i"]?.toIntOrNull() ?: 0
+            return err(quiet, id, "EBADMEDIUM: only direct (t=d) uploads are supported")
         }
+
+        // Resolve which upload chain this chunk belongs to.
+        val chunkOnlyKeys = params.keys.all { it == "m" || it == "q" || it == "a" }
+        var chainId: Int? = null
+        var chainParams = params
+        if (params.containsKey("i")) {
+            chainId = params["i"]?.toIntOrNull() ?: 0
+        } else if (params.containsKey("I")) {
+            // A number always starts a new image.
+            chainId = nextAutoId++
+            params["I"]?.toIntOrNull()?.let { num ->
+                if (num != 0) {
+                    numbers.getOrPut(num) { mutableListOf() }.add(chainId!!)
+                }
+            }
+        } else if (chunkOnlyKeys) {
+            chainId = lastChainId
+            val first = chainId?.let { pending[it] }
+            if (first != null) chainParams = first.params
+        }
+        // Anonymous single-chunk upload.
+        if (chainId == null) chainId = 0
+
+        val more = params["m"]?.toIntOrNull() ?: 0
+        val data = try {
+            Base64.decode(payload, Base64.DEFAULT)
+        } catch (e: Exception) {
+            pending.remove(chainId)
+            if (chainId == lastChainId) lastChainId = null
+            return err(quiet, chainId ?: 0, "EINVAL: bad base64 payload")
+        }
+
+        if (more == 1) {
+            val state = pending.getOrPut(chainId) { PendingUpload(chainParams) }
+            if (state.params !== chainParams && pending[chainId]?.data?.size() == 0) {
+                state.params = chainParams
+            }
+            state.data.write(data)
+            lastChainId = chainId
+            return emptyList()
+        }
+
+        // Final chunk.
+        val first = pending.remove(chainId)
+        if (chainId == lastChainId) lastChainId = null
+        val effective = if (first != null && chunkOnlyKeys) first.params else chainParams
+        val complete = ByteArrayOutputStream().also { out ->
+            first?.data?.writeTo(out)
+            out.write(data)
+        }.toByteArray()
+
+        return finishLoad(effective, complete, action, quiet, chainId)
     }
 
-    private fun handleTransmission(params: Map<String, String>, payload: String): KittyImage? {
-        val imageId = params["i"]?.toIntOrNull() ?: currentImageId++
+    private fun finishLoad(
+        params: Map<String, String>,
+        data: ByteArray,
+        action: String,
+        quiet: Int,
+        chainId: Int
+    ): List<KittyEvent> {
         val format = params["f"]?.toIntOrNull() ?: FORMAT_RGBA
         val width = params["s"]?.toIntOrNull() ?: 0
         val height = params["v"]?.toIntOrNull() ?: 0
-        val moreChunks = params["m"]?.toIntOrNull() ?: 0
-        val compressed = params["o"] == "z"
 
-        // Decode base64 payload
-        val imageData = try {
-            Base64.decode(payload, Base64.DEFAULT)
-        } catch (e: Exception) {
-            return null
+        var raw = data
+        if (params["o"] == "z") {
+            raw = try {
+                InflaterInputStream(ByteArrayInputStream(data)).readBytes()
+            } catch (e: Exception) {
+                return err(quiet, chainId, "EINVAL: bad zlib data")
+            }
         }
 
-        if (moreChunks == 1) {
-            // More chunks coming
-            isReceivingChunks = true
-            currentChunkBuffer.write(imageData)
-            return null
+        val bitmap = when (format) {
+            FORMAT_RGB -> createRgbBitmap(raw, width, height)
+            FORMAT_RGBA -> createRgbaBitmap(raw, width, height)
+            FORMAT_PNG -> createPngBitmap(raw)
+            else -> null
+        } ?: return err(quiet, chainId, "EINVAL: bad image data")
+
+        // Query action: validate only, never store or display.
+        if (action == ACTION_QUERY) {
+            return ok(quiet, chainId, null)
+        }
+
+        val imageId = if (params.containsKey("i")) {
+            params["i"]?.toIntOrNull() ?: 0
         } else {
-            // Final chunk
-            val completeData = if (isReceivingChunks) {
-                currentChunkBuffer.write(imageData)
-                val result = currentChunkBuffer.toByteArray()
-                currentChunkBuffer.reset()
-                isReceivingChunks = false
-                result
-            } else {
-                imageData
-            }
+            chainId
+        }
 
-            // Create bitmap based on format
-            val bitmap = when (format) {
-                FORMAT_RGB -> createRgbBitmap(completeData, width, height)
-                FORMAT_RGBA -> createRgbaBitmap(completeData, width, height)
-                FORMAT_PNG -> createPngBitmap(completeData)
-                else -> return null
-            } ?: return null
-
-            val image = KittyImage(
-                id = imageId,
-                bitmap = bitmap,
-                width = bitmap.width,
-                height = bitmap.height,
-                format = format
-            )
-
+        // Re-transmission replaces the old image (placements die with it;
+        // the UI layer drops them when the bitmap identity changes... see
+        // replaceImage below which returns the replaced ids).
+        if (imageId != 0) {
+            images.remove(imageId)
+        }
+        val image = KittyImage(
+            id = imageId,
+            bitmap = bitmap,
+            width = bitmap.width,
+            height = bitmap.height,
+            format = format
+        )
+        if (imageId != 0) {
             images[imageId] = image
-            return image
+        }
+
+        // Frames are stored like plain images but never auto-displayed.
+        if (action == ACTION_FRAME) {
+            return ok(quiet, imageId, null)
+        }
+
+        if (action == ACTION_TRANSMIT) {
+            return ok(quiet, imageId, params["p"]?.toIntOrNull())
+        }
+
+        // Transmit-and-display.
+        if (params["U"]?.toIntOrNull() == 1) {
+            // Virtual placement for Unicode placeholders: stored, not drawn.
+            return ok(quiet, imageId, params["p"]?.toIntOrNull())
+        }
+        return listOf(KittyEvent.Show(image, placementOf(params))) +
+            ok(quiet, imageId, params["p"]?.toIntOrNull())
+    }
+
+    private fun placementOf(params: Map<String, String>): ShowOp {
+        return ShowOp(
+            destCols = params["c"]?.toIntOrNull() ?: 0,
+            destRows = params["r"]?.toIntOrNull() ?: 0,
+            srcX = params["x"]?.toIntOrNull() ?: 0,
+            srcY = params["y"]?.toIntOrNull() ?: 0,
+            srcW = params["w"]?.toIntOrNull() ?: 0,
+            srcH = params["h"]?.toIntOrNull() ?: 0,
+            xOffPx = params["X"]?.toIntOrNull() ?: 0,
+            yOffPx = params["Y"]?.toIntOrNull() ?: 0,
+            zIndex = params["z"]?.toIntOrNull() ?: 0,
+            noCursorMove = params["C"]?.toIntOrNull() == 1
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Put / delete
+    // ------------------------------------------------------------------
+
+    private fun handlePut(params: Map<String, String>, quiet: Int): List<KittyEvent> {
+        val image: KittyImage? = when {
+            params.containsKey("i") -> images[params["i"]?.toIntOrNull()]
+            params.containsKey("I") -> {
+                val num = params["I"]?.toIntOrNull() ?: 0
+                numbers[num]?.lastOrNull()?.let { images[it] }
+            }
+            else -> null
+        }
+        if (image == null) {
+            val id = params["i"]?.toIntOrNull() ?: 0
+            return err(quiet, id, "ENOENT: no image with the given id")
+        }
+        if (params["U"]?.toIntOrNull() == 1) {
+            return ok(quiet, image.id, params["p"]?.toIntOrNull())
+        }
+        return listOf(KittyEvent.Show(image, placementOf(params))) +
+            ok(quiet, image.id, params["p"]?.toIntOrNull())
+    }
+
+    private fun handleDelete(params: Map<String, String>): List<KittyEvent> {
+        val raw = params["d"] ?: "a"
+        val kind = raw.firstOrNull() ?: 'a'
+        val freeData = kind.isUpperCase()
+        val selector = DeleteSelector(
+            kind = kind.lowercaseChar(),
+            imageId = params["i"]?.toIntOrNull() ?: 0,
+            placementId = params["p"]?.toIntOrNull() ?: 0,
+            number = params["I"]?.toIntOrNull() ?: 0,
+            x = params["x"]?.toIntOrNull() ?: 0,
+            y = params["y"]?.toIntOrNull() ?: 0,
+            z = params["z"]?.toIntOrNull() ?: 0,
+            freeData = freeData,
+            atCursor = kind.lowercaseChar() == 'c'
+        )
+        // Any delete aborts affected partial uploads.
+        if (selector.kind == 'a') {
+            pending.clear()
+            lastChainId = null
+        } else if (selector.imageId != 0) {
+            pending.remove(selector.imageId)
+            if (lastChainId == selector.imageId) lastChainId = null
+        }
+        // Deletes never get responses.
+        return listOf(KittyEvent.Delete(selector))
+    }
+
+    // ------------------------------------------------------------------
+    // Responses (q=1 suppresses OK, q=2 suppresses everything)
+    // ------------------------------------------------------------------
+
+    private fun ok(quiet: Int, id: Int, placementId: Int?): List<KittyEvent> {
+        if (quiet >= 1) return emptyList()
+        val extra = if (placementId != null && placementId != 0) ",p=$placementId" else ""
+        return listOf(KittyEvent.Respond("$APC_START" + "Gi=$id$extra;OK$APC_END"))
+    }
+
+    private fun err(quiet: Int, id: Int, message: String): List<KittyEvent> {
+        if (quiet >= 2) return emptyList()
+        return listOf(KittyEvent.Respond("$APC_START" + "Gi=$id;$message$APC_END"))
+    }
+
+    // ------------------------------------------------------------------
+    // Store access for the UI layer
+    // ------------------------------------------------------------------
+
+    fun newestIdForNumber(number: Int): Int? = numbers[number]?.lastOrNull()
+
+    fun freeUnreferenced(keepIds: Set<Int>) {
+        val it = images.keys.iterator()
+        while (it.hasNext()) {
+            if (it.next() !in keepIds) it.remove()
+        }
+        val nit = numbers.entries.iterator()
+        while (nit.hasNext()) {
+            val e = nit.next()
+            e.value.removeAll { id -> id !in images }
+            if (e.value.isEmpty()) nit.remove()
+        }
+    }
+
+    fun clearStoredImages() {
+        images.clear()
+        numbers.clear()
+        pending.clear()
+        lastChainId = null
+    }
+
+    fun getImage(id: Int): KittyImage? = images[id]
+    fun getAllImages(): Map<Int, KittyImage> = images.toMap()
+
+    // ------------------------------------------------------------------
+    // Bitmap decoding
+    // ------------------------------------------------------------------
+
+    private fun parseControlData(data: String): Map<String, String> {
+        if (data.isEmpty()) return emptyMap()
+        return data.split(",").associate { pair ->
+            val kv = pair.split("=", limit = 2)
+            if (kv.size == 2) kv[0] to kv[1] else kv[0] to ""
         }
     }
 
@@ -191,23 +445,8 @@ class KittyProtocolParser {
     }
 
     private fun createPngBitmap(data: ByteArray): Bitmap? {
+        if (data.isEmpty()) return null
         return BitmapFactory.decodeByteArray(data, 0, data.size)
-    }
-
-    private fun handlePut(params: Map<String, String>): KittyImage? {
-        val imageId = params["i"]?.toIntOrNull() ?: return null
-        return images[imageId]
-    }
-
-    private fun handleDelete(params: Map<String, String>) {
-        val imageId = params["i"]?.toIntOrNull()
-        val deleteAll = params["d"] == "a"
-        
-        if (deleteAll) {
-            images.clear()
-        } else if (imageId != null) {
-            images.remove(imageId)
-        }
     }
 
     /**
@@ -218,29 +457,29 @@ class KittyProtocolParser {
     }
 
     /**
-     * Extract all Kitty graphics sequences from text.
+     * Extract all complete Kitty graphics sequences from text, in order.
      */
     fun extractSequences(text: String): List<String> {
-        val sequences = mutableListOf<String>()
+        return extractSequenceRanges(text).map { text.substring(it) }
+    }
+
+    fun extractSequenceRanges(text: String): List<IntRange> {
+        val ranges = mutableListOf<IntRange>()
         var start = 0
-        
+
         while (true) {
             val begin = text.indexOf(APC_START, start)
             if (begin == -1) break
-            
+
             val end = text.indexOf(APC_END, begin)
             if (end == -1) break
-            
-            sequences.add(text.substring(begin, end + APC_END.length))
+
+            ranges.add(begin until end + APC_END.length)
             start = end + APC_END.length
         }
-        
-        return sequences
-    }
 
-    fun getImage(id: Int): KittyImage? = images[id]
-    fun getAllImages(): Map<Int, KittyImage> = images.toMap()
-    fun clearImages() = images.clear()
+        return ranges
+    }
 }
 
 data class KittyImage(

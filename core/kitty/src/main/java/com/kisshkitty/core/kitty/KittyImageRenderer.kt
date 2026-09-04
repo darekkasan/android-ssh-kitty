@@ -1,88 +1,62 @@
 package com.kisshkitty.core.kitty
 
-import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Rect
+import com.kisshkitty.core.kitty.KittyProtocolParser.DeleteSelector
+import com.kisshkitty.core.kitty.KittyProtocolParser.KittyEvent
+import com.kisshkitty.core.kitty.KittyProtocolParser.ShowOp
 
 /**
- * Renderer for Kitty protocol images in a terminal context.
- * Handles positioning and drawing images based on terminal cell coordinates.
+ * Turns raw terminal output into clean text plus ordered Kitty events.
+ *
+ * Text and graphics sequences are processed in stream order so image
+ * anchors line up with the cursor position at display time.
  */
 class KittyImageRenderer {
 
     private val parser = KittyProtocolParser()
-    private var cellWidth = 0
-    private var cellHeight = 0
-    private var terminalWidth = 0
-    private var terminalHeight = 0
 
-    /**
-     * Update terminal dimensions for proper image scaling.
-     */
-    fun updateTerminalDimensions(cols: Int, rows: Int, pixelWidth: Int, pixelHeight: Int) {
-        terminalWidth = pixelWidth
-        terminalHeight = pixelHeight
-        cellWidth = if (cols > 0) pixelWidth / cols else 0
-        cellHeight = if (rows > 0) pixelHeight / rows else 0
+    sealed interface OutputEvent {
+        data class Text(val text: String) : OutputEvent
+        data class Show(val image: KittyImage, val op: ShowOp) : OutputEvent
+        data class Delete(val selector: DeleteSelector) : OutputEvent
+        data class Respond(val payload: String) : OutputEvent
     }
 
+    data class KittyOutput(
+        val events: List<OutputEvent>
+    )
+
     /**
-     * Process text output from the terminal, extracting and rendering Kitty images.
+     * Split text around complete Kitty sequences, parsing each one.
+     * Only complete sequences are passed here (the UI layer holds back
+     * a trailing incomplete escape).
      */
-    fun processOutput(text: String): TerminalOutput {
+    fun processOutput(text: String): KittyOutput {
         if (!parser.containsKittySequence(text)) {
-            return TerminalOutput(text, emptyList())
+            return KittyOutput(listOf(OutputEvent.Text(text)))
         }
 
-        val sequences = parser.extractSequences(text)
-        val images = mutableListOf<RenderedImage>()
-
-        // Remove sequences from text
-        var cleanText = text
-        for (seq in sequences) {
-            cleanText = cleanText.replace(seq, "")
-        }
-
-        // Parse each sequence and prepare for rendering
-        for (seq in sequences) {
-            val image = parser.parse(seq)
-            if (image != null) {
-                images.add(
-                    RenderedImage(
-                        image = image,
-                        x = image.placement?.x ?: 0,
-                        y = image.placement?.y ?: 0,
-                        width = image.placement?.columns?.let { it * cellWidth } ?: image.width,
-                        height = image.placement?.rows?.let { it * cellHeight } ?: image.height
-                    )
+        val events = mutableListOf<OutputEvent>()
+        var cursor = 0
+        for (range in parser.extractSequenceRanges(text)) {
+            if (range.first > cursor) {
+                events.add(OutputEvent.Text(text.substring(cursor, range.first)))
+            }
+            val sequence = text.substring(range)
+            for (event in parser.parse(sequence)) {
+                events.add(
+                    when (event) {
+                        is KittyEvent.Show -> OutputEvent.Show(event.image, event.op)
+                        is KittyEvent.Delete -> OutputEvent.Delete(event.selector)
+                        is KittyEvent.Respond -> OutputEvent.Respond(event.payload)
+                    }
                 )
             }
+            cursor = range.last + 1
         }
-
-        return TerminalOutput(cleanText, images)
-    }
-
-    /**
-     * Render all images onto a canvas at their specified positions.
-     */
-    fun renderImages(canvas: Canvas, images: List<RenderedImage>) {
-        for (renderedImage in images) {
-            val image = renderedImage.image
-            val destRect = Rect(
-                renderedImage.x,
-                renderedImage.y,
-                renderedImage.x + renderedImage.width,
-                renderedImage.y + renderedImage.height
-            )
-
-            val paint = Paint().apply {
-                isAntiAlias = true
-                isFilterBitmap = true
-            }
-
-            canvas.drawBitmap(image.bitmap, null, destRect, paint)
+        if (cursor < text.length) {
+            events.add(OutputEvent.Text(text.substring(cursor)))
         }
+        return KittyOutput(events)
     }
 
     /**
@@ -95,16 +69,3 @@ class KittyImageRenderer {
 
     fun getParser(): KittyProtocolParser = parser
 }
-
-data class TerminalOutput(
-    val text: String,
-    val images: List<RenderedImage>
-)
-
-data class RenderedImage(
-    val image: KittyImage,
-    val x: Int,
-    val y: Int,
-    val width: Int,
-    val height: Int
-)
