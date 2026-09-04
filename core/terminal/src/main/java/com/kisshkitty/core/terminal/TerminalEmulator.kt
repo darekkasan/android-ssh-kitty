@@ -13,9 +13,9 @@ class TerminalEmulator(
     private var cols: Int = 80,
     private var rows: Int = 24
 ) {
-    private val buffer = Array(rows) { CharArray(cols) { ' ' } }
-    private val colors = Array(rows) { IntArray(cols) { Color.WHITE } }
-    private val attributes = Array(rows) { IntArray(cols) { 0 } }
+    private var buffer = Array(rows) { CharArray(cols) { ' ' } }
+    private var colors = Array(rows) { IntArray(cols) { Color.WHITE } }
+    private var attributes = Array(rows) { IntArray(cols) { 0 } }
     
     private var cursorX = 0
     private var cursorY = 0
@@ -87,8 +87,8 @@ class TerminalEmulator(
                     i++
                 }
                 else -> {
-                    // Regular character
-                    if (cursorX < cols && cursorY < rows) {
+                    // Regular character (guard with real array bounds)
+                    if (cursorY in buffer.indices && cursorX in buffer[cursorY].indices) {
                         buffer[cursorY][cursorX] = char
                         colors[cursorY][cursorX] = currentColor
                         attributes[cursorY][cursorX] = currentAttributes
@@ -320,32 +320,32 @@ class TerminalEmulator(
     }
 
     fun resize(newCols: Int, newRows: Int) {
+        if (newCols == cols && newRows == rows) return
+        // Copy content into the new grid using real array bounds
+        // (never the cols/rows fields, which may already disagree).
         val newBuffer = Array(newRows) { y ->
             CharArray(newCols) { x ->
-                if (y < rows && x < cols) buffer[y][x] else ' '
+                if (y < buffer.size && x < buffer[y].size) buffer[y][x] else ' '
             }
         }
         val newColors = Array(newRows) { y ->
             IntArray(newCols) { x ->
-                if (y < rows && x < cols) colors[y][x] else currentColor
+                if (y < colors.size && x < colors[y].size) colors[y][x] else currentColor
             }
         }
-        
-        buffer.forEachIndexed { y, row -> 
-            if (y < newRows) {
-                newBuffer[y] = CharArray(newCols) { x ->
-                    if (x < cols) row[x] else ' '
-                }
-                newColors[y] = IntArray(newCols) { x ->
-                    if (x < cols) colors[y][x] else currentColor
-                }
+        val newAttributes = Array(newRows) { y ->
+            IntArray(newCols) { x ->
+                if (y < attributes.size && x < attributes[y].size) attributes[y][x] else 0
             }
         }
-        
+
+        buffer = newBuffer
+        colors = newColors
+        attributes = newAttributes
         cols = newCols
         rows = newRows
-        cursorX = cursorX.coerceAtMost(cols - 1)
-        cursorY = cursorY.coerceAtMost(rows - 1)
+        cursorX = cursorX.coerceIn(0, (cols - 1).coerceAtLeast(0))
+        cursorY = cursorY.coerceIn(0, (rows - 1).coerceAtLeast(0))
     }
 
     fun getBuffer(): Array<CharArray> = buffer
