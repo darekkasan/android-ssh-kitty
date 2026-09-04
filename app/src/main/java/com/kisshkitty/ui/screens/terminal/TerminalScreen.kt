@@ -12,6 +12,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -21,6 +22,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
@@ -209,18 +211,23 @@ fun TerminalScreen(
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     var inputText by remember { mutableStateOf("") }
+    var isTextFieldPlaced by remember { mutableStateOf(false) }
 
     // Auto-connect on first load
     LaunchedEffect(hostId) {
         viewModel.connect(hostId)
     }
 
-    // Auto-focus after connection is established
-    LaunchedEffect(terminalState) {
-        if (terminalState is TerminalState.Connected) {
-            kotlinx.coroutines.delay(1000)
+    // Auto-focus only after the hidden text field is actually placed.
+    // requestFocus() triggers BringIntoView asynchronously, and calling it
+    // before placement crashes with "BringIntoViewRequester ... before
+    // parents are placed" (a try-catch can't help since it is async).
+    LaunchedEffect(terminalState, isTextFieldPlaced) {
+        if (terminalState is TerminalState.Connected && isTextFieldPlaced) {
+            kotlinx.coroutines.delay(200)
             try {
                 focusRequester.requestFocus()
+                keyboardController?.show()
             } catch (_: Exception) {}
         }
     }
@@ -276,7 +283,9 @@ fun TerminalScreen(
                 )
             }
 
-            // Hidden text field for keyboard input
+            // Hidden text field for keyboard input.
+            // NOTE: must NOT be size(0.dp). A zero-size field breaks
+            // BringIntoView on requestFocus() and crashes the app.
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
@@ -301,7 +310,9 @@ fun TerminalScreen(
                 },
                 modifier = Modifier
                     .focusRequester(focusRequester)
-                    .size(0.dp),
+                    .size(1.dp)
+                    .alpha(0.01f)
+                    .onPlaced { isTextFieldPlaced = true },
                 cursorBrush = SolidColor(Color.Transparent),
                 textStyle = TextStyle(color = Color.Transparent)
             )
