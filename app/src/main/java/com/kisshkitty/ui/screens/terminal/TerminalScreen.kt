@@ -1,14 +1,19 @@
 package com.kisshkitty.ui.screens.terminal
 
 import android.graphics.Typeface
+import android.widget.Toast
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Keyboard
+import androidx.compose.material.icons.filled.KeyboardHide
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,15 +29,23 @@ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onPlaced
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.kisshkitty.core.kitty.KittyImage
 import com.kisshkitty.core.kitty.KittyImageRenderer
+import com.kisshkitty.core.kitty.KittyProtocolParser
 import com.kisshkitty.core.terminal.TerminalEmulator
 import com.kisshkitty.core.ssh.SshConfig
 import com.kisshkitty.core.ssh.SshConnectionManager
@@ -70,6 +83,9 @@ class TerminalViewModel @Inject constructor(
     private val terminalEmulator = TerminalEmulator()
     private val kittyRenderer = KittyImageRenderer()
     private var readingJob: kotlinx.coroutines.Job? = null
+    // Raw bytes not yet processed. Incomplete trailing Kitty sequences
+    // stay here until the rest arrives.
+    private var pendingRaw = StringBuilder()
 
     fun connect(hostId: String) {
         viewModelScope.launch {
@@ -119,20 +135,39 @@ class TerminalViewModel @Inject constructor(
 
     private fun processTerminalOutput(text: String) {
         try {
-            if (kittyRenderer.getParser().containsKittySequence(text)) {
-                val output = kittyRenderer.processOutput(text)
-                terminalEmulator.processOutput(output.text)
-                val newImages = output.images.map { it.image }
-                if (newImages.isNotEmpty()) {
-                    _kittyImages.value = _kittyImages.value + newImages
+            pendingRaw.append(text)
+            var raw = pendingRaw.toString()
+            // A Kitty APC sequence can be split across reads. Hold back a
+            // trailing unterminated sequence until the rest arrives.
+            // (Cap the hold-back so garbage can never grow unbounded.)
+            var holdBack = ""
+            val start = raw.lastIndexOf(KittyProtocolParser.APC_START)
+            val end = raw.lastIndexOf(KittyProtocolParser.APC_END)
+            if (start != -1 && start > end) {
+                if (raw.length - start > 2_000_000) {
+                    // Too long to be a real sequence: flush it as text.
+                } else {
+                    holdBack = raw.substring(start)
+                    raw = raw.substring(0, start)
                 }
-            } else {
-                terminalEmulator.processOutput(text)
             }
+            if (raw.isNotEmpty()) {
+                if (kittyRenderer.getParser().containsKittySequence(raw)) {
+                    val output = kittyRenderer.processOutput(raw)
+                    terminalEmulator.processOutput(output.text)
+                    val newImages = output.images.map { it.image }
+                    if (newImages.isNotEmpty()) {
+                        _kittyImages.value = _kittyImages.value + newImages
+                    }
+                } else {
+                    terminalEmulator.processOutput(raw)
+                }
 
-            _terminalBuffer.value = terminalEmulator.getBuffer()
-            _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
-            _terminalColors.value = terminalEmulator.getColors()
+                _terminalBuffer.value = terminalEmulator.getBuffer()
+                _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
+                _terminalColors.value = terminalEmulator.getColors()
+            }
+            pendingRaw = StringBuilder(holdBack)
         } catch (e: Exception) {
             // Log error but don't crash
             e.printStackTrace()
@@ -177,6 +212,16 @@ class TerminalViewModel @Inject constructor(
         _terminalState.value = TerminalState.Disconnected
     }
 
+    fun resizeIfNeeded(cols: Int, rows: Int) {
+        if (cols != terminalEmulator.getCols() || rows != terminalEmulator.getRows()) {
+            terminalEmulator.resize(cols, rows)
+            sshConnectionManager.resizeTerminal(cols, rows)
+            _terminalBuffer.value = terminalEmulator.getBuffer()
+            _cursorPosition.value = Pair(terminalEmulator.getCursorX(), terminalEmulator.getCursorY())
+            _terminalColors.value = terminalEmulator.getColors()
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         disconnect()
@@ -195,6 +240,22 @@ enum class SpecialKey {
     UP, DOWN, LEFT, RIGHT, HOME, END, PAGE_UP, PAGE_DOWN
 }
 
+// Terminal font size. The grid (cols x rows) is derived from this via
+// monospace metrics, so glyphs never overlap and rows never stretch.
+private val TERMINAL_FONT_SIZE = 14.sp
+
+// Sentinel kept in the hidden input field so the keyboard Backspace key
+// always has something to delete (an empty field produces no event).
+// U+FEFF is invisible and is never sent: diffs only send the suffix.
+private const val INPUT_SENTINEL = "﻿"
+
+private data class CellMetrics(
+    val textSizePx: Float,
+    val charWidth: Float,
+    val lineHeight: Float,
+    val baselineOffset: Float
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TerminalScreen(
@@ -210,8 +271,64 @@ fun TerminalScreen(
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
-    var inputText by remember { mutableStateOf("") }
+    var inputText by remember { mutableStateOf(INPUT_SENTINEL) }
     var isTextFieldPlaced by remember { mutableStateOf(false) }
+    var showKeys by remember { mutableStateOf(false) }
+    var selection by remember { mutableStateOf<Pair<Pair<Int, Int>, Pair<Int, Int>>?>(null) }
+
+    val density = LocalDensity.current
+    // Monospace cell metrics. The terminal grid is derived from the font,
+    // so glyphs never overlap and rows never stretch to fill the screen.
+    val cellMetrics = remember(density) {
+        val paint = android.graphics.Paint().apply {
+            typeface = Typeface.MONOSPACE
+            textSize = with(density) { TERMINAL_FONT_SIZE.toPx() }
+            isAntiAlias = true
+        }
+        val fm = paint.fontMetrics
+        CellMetrics(
+            textSizePx = paint.textSize,
+            charWidth = paint.measureText("M"),
+            lineHeight = fm.bottom - fm.top,
+            baselineOffset = -fm.top
+        )
+    }
+
+    val terminalCols = if (terminalBuffer.isNotEmpty()) terminalBuffer[0].size else 80
+    val terminalRows = terminalBuffer.size.coerceAtLeast(1)
+
+    fun cellOf(offset: Offset): Pair<Int, Int> {
+        val x = (offset.x / cellMetrics.charWidth).toInt()
+            .coerceIn(0, (terminalCols - 1).coerceAtLeast(0))
+        val y = (offset.y / cellMetrics.lineHeight).toInt()
+            .coerceIn(0, (terminalRows - 1).coerceAtLeast(0))
+        return x to y
+    }
+
+    fun selectedText(): String {
+        val sel = selection ?: return ""
+        val (ax, ay) = sel.first
+        val (bx, by) = sel.second
+        val (sx, sy, ex, ey) = if (ay < by || (ay == by && ax <= bx)) {
+            listOf(ax, ay, bx, by)
+        } else {
+            listOf(bx, by, ax, ay)
+        }
+        return buildString {
+            for (y in sy..ey) {
+                val row = terminalBuffer.getOrNull(y) ?: continue
+                val fromX = if (y == sy) sx.coerceIn(0, row.size) else 0
+                val toX = if (y == ey) ex.coerceIn(0, row.size) else row.size
+                if (fromX < toX && fromX < row.size) {
+                    append(row.slice(fromX until toX.coerceAtMost(row.size)).joinToString("").trimEnd())
+                }
+                if (y != ey) append('\n')
+            }
+        }
+    }
+
+    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
 
     // Auto-connect on first load
     LaunchedEffect(hostId) {
@@ -267,11 +384,42 @@ fun TerminalScreen(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(Unit) {
-                        detectTapGestures { offset ->
-                            focusRequester.requestFocus()
-                            keyboardController?.show()
-                        }
+                    .onSizeChanged { px ->
+                        // Fit the grid to the screen: no stretched rows,
+                        // no overlapping glyphs.
+                        val cols = (px.width / cellMetrics.charWidth).toInt()
+                            .coerceIn(20, 256)
+                        val rows = (px.height / cellMetrics.lineHeight).toInt()
+                            .coerceIn(8, 200)
+                        viewModel.resizeIfNeeded(cols, rows)
+                    }
+                    .pointerInput(terminalCols, terminalRows) {
+                        detectTapGestures(
+                            onTap = {
+                                if (selection != null) {
+                                    selection = null
+                                } else {
+                                    focusRequester.requestFocus()
+                                    keyboardController?.show()
+                                }
+                            },
+                            onLongPress = { offset ->
+                                val cell = cellOf(offset)
+                                selection = cell to cell
+                            }
+                        )
+                    }
+                    .pointerInput(terminalCols, terminalRows) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = { offset ->
+                                val cell = cellOf(offset)
+                                selection = cell to cell
+                            },
+                            onDrag = { change, _ ->
+                                val anchor = selection?.first ?: cellOf(change.position)
+                                selection = anchor to cellOf(change.position)
+                            }
+                        )
                     }
             ) {
                 TerminalCanvas(
@@ -279,6 +427,11 @@ fun TerminalScreen(
                     colors = terminalColors,
                     cursorPosition = cursorPosition,
                     kittyImages = kittyImages,
+                    selection = selection,
+                    textSizePx = cellMetrics.textSizePx,
+                    cellWidth = cellMetrics.charWidth,
+                    cellHeight = cellMetrics.lineHeight,
+                    baselineOffset = cellMetrics.baselineOffset,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -286,26 +439,25 @@ fun TerminalScreen(
             // Hidden text field for keyboard input.
             // NOTE: must NOT be size(0.dp). A zero-size field breaks
             // BringIntoView on requestFocus() and crashes the app.
+            // The field always holds INPUT_SENTINEL so the Backspace key
+            // always deletes something (an empty field fires no event).
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
-                    if (newValue.length > inputText.length) {
-                        // Character(s) typed - send only the new character(s)
-                        val newChars = newValue.substring(inputText.length)
-                        // Check if Enter was pressed (newline)
-                        if (newChars.contains("\n")) {
-                            viewModel.sendInput("\r")
-                            inputText = ""
-                        } else {
-                            viewModel.sendInput(newChars)
-                            inputText = newValue
-                        }
-                    } else if (newValue.length < inputText.length) {
-                        // Backspace pressed
+                    val common = newValue.commonPrefixWith(inputText).length
+                    val deleted = inputText.length - common
+                    val added = newValue.substring(common)
+                    repeat(deleted) {
                         viewModel.sendInput("\b")
-                        inputText = newValue
+                    }
+                    if (added.contains("\n") || added.contains("\r")) {
+                        viewModel.sendInput("\r")
+                        inputText = INPUT_SENTINEL
                     } else {
-                        inputText = newValue
+                        if (added.isNotEmpty()) {
+                            viewModel.sendInput(added)
+                        }
+                        inputText = if (newValue.isEmpty()) INPUT_SENTINEL else newValue
                     }
                 },
                 modifier = Modifier
@@ -322,37 +474,78 @@ fun TerminalScreen(
                 textStyle = TextStyle(color = Color.Transparent)
             )
 
-            // Special keys - floating at bottom
+            // Bottom controls: selection actions, collapsible key bar, toggle.
+            // The bar is hidden by default so it never covers the terminal.
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.BottomCenter)
-                    .padding(8.dp)
+                    .padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                // Main special keys
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
-                    SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
-                    SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
-                    SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
+                if (selection != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(onClick = {
+                            val text = selectedText()
+                            if (text.isNotEmpty()) {
+                                clipboard.setText(AnnotatedString(text))
+                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                            }
+                            selection = null
+                        }) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = null)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Copy")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(onClick = { selection = null }) {
+                            Text("Cancel")
+                        }
+                    }
                 }
 
-                Spacer(modifier = Modifier.height(4.dp))
+                if (showKeys) {
+                    // Main special keys
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
+                        SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
+                        SpecialKeyButton("Ctrl+C") { viewModel.sendSpecialKey(SpecialKey.CTRL_C) }
+                        SpecialKeyButton("Ctrl+D") { viewModel.sendSpecialKey(SpecialKey.CTRL_D) }
+                    }
 
-                // Arrow keys
+                    // Arrow keys
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
+                        SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
+                        SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
+                    horizontalArrangement = Arrangement.End
                 ) {
-                    SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
-                    SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
-                    SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
+                    SmallFloatingActionButton(
+                        onClick = { showKeys = !showKeys }
+                    ) {
+                        Icon(
+                            if (showKeys) Icons.Default.KeyboardHide else Icons.Default.Keyboard,
+                            contentDescription = "Toggle keys"
+                        )
+                    }
                 }
             }
 
@@ -396,26 +589,27 @@ fun TerminalCanvas(
     colors: Array<IntArray>,
     cursorPosition: Pair<Int, Int>,
     kittyImages: List<KittyImage>,
+    selection: Pair<Pair<Int, Int>, Pair<Int, Int>>?,
+    textSizePx: Float,
+    cellWidth: Float,
+    cellHeight: Float,
+    baselineOffset: Float,
     modifier: Modifier = Modifier
 ) {
     Canvas(modifier = modifier) {
         if (buffer.isEmpty() || buffer[0].isEmpty()) return@Canvas
-        val cellWidth = size.width / buffer[0].size
-        val cellHeight = size.height / buffer.size
+        val cols = buffer[0].size
 
         drawIntoCanvas { canvas ->
             val paint = android.graphics.Paint().apply {
                 color = android.graphics.Color.WHITE
-                // Fit the monospace glyph into the cell so characters
-                // don't overlap (glyph width ~= 0.6 * textSize).
-                textSize = minOf(cellWidth / 0.6f, cellHeight * 0.85f)
+                textSize = textSizePx
                 typeface = Typeface.MONOSPACE
                 isAntiAlias = true
             }
-            val fm = paint.fontMetrics
-            val baselineOffset = (cellHeight - (fm.bottom - fm.top)) / 2 - fm.top
 
-            // Draw terminal content
+            // Draw terminal content. Cell geometry comes from the font,
+            // so glyphs fit their cells exactly.
             for (y in buffer.indices) {
                 for (x in buffer[y].indices) {
                     val char = buffer[y][x]
@@ -432,9 +626,35 @@ fun TerminalCanvas(
             }
         }
 
+        // Draw text selection
+        selection?.let { sel ->
+            val (ax, ay) = sel.first
+            val (bx, by) = sel.second
+            val (sx, sy, ex, ey) = if (ay < by || (ay == by && ax <= bx)) {
+                listOf(ax, ay, bx, by)
+            } else {
+                listOf(bx, by, ax, ay)
+            }
+            for (y in sy.coerceIn(0, buffer.size - 1)..ey.coerceIn(0, buffer.size - 1)) {
+                val fromX = (if (y == sy) sx else 0).coerceIn(0, cols)
+                val toX = (if (y == ey) ex else cols).coerceIn(0, cols)
+                if (fromX <= toX) {
+                    drawRect(
+                        color = Color(0xFF3390FF),
+                        topLeft = Offset(fromX * cellWidth, y * cellHeight),
+                        size = androidx.compose.ui.geometry.Size(
+                            (toX - fromX + 1) * cellWidth,
+                            cellHeight
+                        ),
+                        alpha = 0.35f
+                    )
+                }
+            }
+        }
+
         // Draw cursor
-        val cursorX = cursorPosition.first
-        val cursorY = cursorPosition.second
+        val cursorX = cursorPosition.first.coerceIn(0, (cols - 1).coerceAtLeast(0))
+        val cursorY = cursorPosition.second.coerceIn(0, (buffer.size - 1).coerceAtLeast(0))
         drawRect(
             color = Color.White,
             topLeft = Offset(cursorX * cellWidth, cursorY * cellHeight),
@@ -442,13 +662,20 @@ fun TerminalCanvas(
             alpha = 0.5f
         )
 
-        // Draw Kitty images
+        // Draw Kitty images, scaled to fit the screen
         for (image in kittyImages) {
-            drawImage(
-                image = image.bitmap.asImageBitmap(),
-                topLeft = Offset(0f, 0f),
-                alpha = 1f
-            )
+            val bw = image.bitmap.width
+            val bh = image.bitmap.height
+            if (bw > 0 && bh > 0) {
+                val scale = minOf(size.width / bw, size.height / bh).coerceIn(0.1f, 4f)
+                drawImage(
+                    image = image.bitmap.asImageBitmap(),
+                    dstSize = IntSize(
+                        (bw * scale).toInt().coerceAtLeast(1),
+                        (bh * scale).toInt().coerceAtLeast(1)
+                    )
+                )
+            }
         }
     }
 }
