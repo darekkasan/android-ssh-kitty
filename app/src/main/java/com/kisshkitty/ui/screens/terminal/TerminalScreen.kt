@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
@@ -23,11 +24,10 @@ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onPlaced
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -313,6 +313,11 @@ fun TerminalScreen(
                     .size(1.dp)
                     .alpha(0.01f)
                     .onPlaced { isTextFieldPlaced = true },
+                // Password mode: no suggestions / autocorrect on the terminal.
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    autoCorrect = false
+                ),
                 cursorBrush = SolidColor(Color.Transparent),
                 textStyle = TextStyle(color = Color.Transparent)
             )
@@ -393,33 +398,33 @@ fun TerminalCanvas(
     kittyImages: List<KittyImage>,
     modifier: Modifier = Modifier
 ) {
-    val density = LocalDensity.current
-    val fontSize = 14.sp
-    val fontSizePx = with(density) { fontSize.toPx() }
-
     Canvas(modifier = modifier) {
+        if (buffer.isEmpty() || buffer[0].isEmpty()) return@Canvas
         val cellWidth = size.width / buffer[0].size
         val cellHeight = size.height / buffer.size
 
         drawIntoCanvas { canvas ->
             val paint = android.graphics.Paint().apply {
                 color = android.graphics.Color.WHITE
-                textSize = fontSizePx
+                // Fit the monospace glyph into the cell so characters
+                // don't overlap (glyph width ~= 0.6 * textSize).
+                textSize = minOf(cellWidth / 0.6f, cellHeight * 0.85f)
                 typeface = Typeface.MONOSPACE
                 isAntiAlias = true
             }
+            val fm = paint.fontMetrics
+            val baselineOffset = (cellHeight - (fm.bottom - fm.top)) / 2 - fm.top
 
             // Draw terminal content
             for (y in buffer.indices) {
                 for (x in buffer[y].indices) {
                     val char = buffer[y][x]
                     if (char != ' ') {
-                        val color = colors[y][x]
-                        paint.color = color
+                        paint.color = colors[y][x]
                         canvas.nativeCanvas.drawText(
                             char.toString(),
                             x * cellWidth,
-                            (y + 1) * cellHeight - 4f,
+                            y * cellHeight + baselineOffset,
                             paint
                         )
                     }
