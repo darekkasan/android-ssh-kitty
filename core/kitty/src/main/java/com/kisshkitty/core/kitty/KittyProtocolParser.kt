@@ -126,6 +126,13 @@ class KittyProtocolParser {
         val params = parseControlData(content.substring(0, separatorIndex))
         val payload = content.substring(separatorIndex + 1)
 
+        // Foreign protocol responses (our own echoed replies, real
+        // kitty replies, DA answers) always carry Gi and are never
+        // client commands. Ignore them outright: parsing them as
+        // anonymous uploads steals pending chunk state and the error
+        // responses they spawn loop forever through pty echo.
+        if (params.containsKey("Gi")) return emptyList()
+
         val action = params["a"] ?: ACTION_TRANSMIT
         val quiet = params["q"]?.toIntOrNull() ?: 0
         val hasI = params.containsKey("i")
