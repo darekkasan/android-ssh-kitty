@@ -524,15 +524,34 @@ fun TerminalScreen(
     val terminalLineHeightSp = with(density) { cellMetrics.lineHeight.toSp() }
 
     // Visible text (standard Android selection) + its selection state.
-    // Rebuilt whenever the viewport changes; the selection survives when
-    // the window didn't move and is cleared when it scrolled.
+    // Rebuilt whenever the viewport changes. When the window scrolled,
+    // the highlight shifts with it so it stays glued to the same text
+    // instead of being wiped (wiping made selection impossible while
+    // output was streaming).
     var fieldValue by remember { mutableStateOf(TextFieldValue(AnnotatedString(""))) }
     var lastWindowStart by remember { mutableStateOf<Int?>(null) }
+    var lastCols by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(viewport) {
         val annotated = buildTerminalAnnotated(viewport)
-        val reset = lastWindowStart != null && lastWindowStart != viewport.windowStart
+        val cols = if (viewport.chars.isNotEmpty()) viewport.chars[0].size else 0
+        val prevStart = lastWindowStart
+        val prevCols = lastCols
         lastWindowStart = viewport.windowStart
-        val sel = if (reset) {
+        lastCols = cols
+        val sel = if (prevStart != null && prevStart != viewport.windowStart &&
+            prevCols == cols && cols > 0
+        ) {
+            val stride = cols + 1
+            val d = viewport.windowStart - prevStart
+            val rows = (viewport.chars.size - 1).coerceAtLeast(0)
+            fun shift(off: Int): Int {
+                val y = (off / stride - d).coerceIn(0, rows)
+                val x = (off % stride).coerceIn(0, cols)
+                return (y * stride + x).coerceIn(0, annotated.length)
+            }
+            val s = fieldValue.selection
+            TextRange(shift(s.start), shift(s.end))
+        } else if (prevStart == null || prevCols != cols) {
             TextRange.Zero
         } else {
             val s = fieldValue.selection
@@ -541,6 +560,8 @@ fun TerminalScreen(
                 s.end.coerceIn(0, annotated.length)
             )
         }
+        fieldValue = TextFieldValue(annotated, sel)
+    }
         fieldValue = TextFieldValue(annotated, sel)
     }
     // Fresh read for gesture guards without relaunch churn.
