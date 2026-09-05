@@ -30,6 +30,11 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.awaitEachGesture
+import androidx.compose.ui.input.pointer.awaitFirstDown
+import androidx.compose.ui.input.pointer.awaitPointerEvent
+import androidx.compose.ui.input.pointer.awaitTouchSlopOrCancellation
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.onSizeChanged
