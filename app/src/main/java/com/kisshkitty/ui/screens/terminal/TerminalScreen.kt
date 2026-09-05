@@ -14,6 +14,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -44,6 +45,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -690,18 +692,19 @@ fun TerminalScreen(
                     // already sent, so only the fresh suffix is new input.
                     // (This also makes IME full-replacements harmless: no
                     // phantom backspaces, no re-sent history.)
-                    var fresh = if (newValue.startsWith(INPUT_SENTINEL)) {
+                    val fresh = if (newValue.startsWith(INPUT_SENTINEL)) {
                         newValue.substring(INPUT_SENTINEL.length)
                     } else {
                         newValue
                     }
-                    val newlineAt = fresh.indexOfFirst { it == '\n' || it == '\r' }
-                    if (newlineAt != -1) {
-                        val before = fresh.substring(0, newlineAt)
-                        if (before.isNotEmpty()) viewModel.sendInput(before)
-                        viewModel.sendInput("\r")
-                    } else if (fresh.isNotEmpty()) {
-                        viewModel.sendInput(fresh)
+                    if (fresh.isNotEmpty()) {
+                        // Normalize newlines (stray \r\n must not double).
+                        // Enter itself normally arrives via onSend below;
+                        // this is only a fallback for keyboards that commit
+                        // raw newlines (possibly several at once).
+                        viewModel.sendInput(
+                            fresh.replace("\r\n", "\r").replace('\n', '\r')
+                        )
                     } else if (newValue.isEmpty()) {
                         // The sentinel itself was deleted: real Backspace.
                         viewModel.sendInput("\b")
@@ -714,10 +717,17 @@ fun TerminalScreen(
                     .alpha(0.01f)
                     .onPlaced { isTextFieldPlaced = true },
                 // Password mode: no suggestions / autocorrect on the terminal.
+                // Enter is an IME action so it fires reliably every time
+                // instead of depending on text commits.
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Password,
-                    autoCorrect = false
+                    autoCorrect = false,
+                    imeAction = ImeAction.Send
                 ),
+                keyboardActions = KeyboardActions(
+                    onSend = { viewModel.sendInput("\r") }
+                ),
+                singleLine = true,
                 cursorBrush = SolidColor(Color.Transparent),
                 textStyle = TextStyle(color = Color.Transparent)
             )
