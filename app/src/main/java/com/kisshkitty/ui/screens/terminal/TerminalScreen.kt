@@ -8,7 +8,6 @@ import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.BasicTextField
@@ -61,8 +60,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.math.roundToInt
 import javax.inject.Inject
 
@@ -320,6 +321,8 @@ class TerminalViewModel @Inject constructor(
         cellH = lineHeightPx
     }
 
+    fun getLine(absLine: Int): CharArray? = terminalEmulator.getAbsoluteLine(absLine)
+
     fun isBracketedPaste(): Boolean = terminalEmulator.bracketedPaste
 
     fun sendInput(text: String) {
@@ -448,7 +451,10 @@ fun TerminalScreen(
     var inputText by remember { mutableStateOf(INPUT_SENTINEL) }
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
-    var selection by remember { mutableStateOf<Pair<Pair<Int, Int>, Pair<Int, Int>>?>(null) }
+    // Selection in absolute lines (col, absLine) so it survives scrolling.
+    var selectionAbs by remember { mutableStateOf<Pair<Pair<Int, Int>, Pair<Int, Int>>?>(null) }
+    // Fresh read for gestures without relaunch churn.
+    val selectionRef = rememberUpdatedState(selectionAbs)
     var scrollAcc by remember { mutableFloatStateOf(0f) }
 
     val density = LocalDensity.current
@@ -471,22 +477,24 @@ fun TerminalScreen(
 
     val terminalCols = if (viewport.chars.isNotEmpty()) viewport.chars[0].size else 80
     val terminalRows = viewport.chars.size.coerceAtLeast(1)
+    // Always-fresh window start for gestures (no relaunch churn).
+    val windowStartRef = rememberUpdatedState(viewport.windowStart)
 
     // Report metrics for image cell resolution, then fit the grid.
     LaunchedEffect(cellMetrics) {
         viewModel.setCellMetrics(cellMetrics.charWidth, cellMetrics.lineHeight)
     }
 
-    fun cellOf(offset: Offset): Pair<Int, Int> {
+    fun cellOfAbs(offset: Offset): Pair<Int, Int> {
         val x = (offset.x / cellMetrics.charWidth).toInt()
             .coerceIn(0, (terminalCols - 1).coerceAtLeast(0))
         val y = (offset.y / cellMetrics.lineHeight).toInt()
             .coerceIn(0, (terminalRows - 1).coerceAtLeast(0))
-        return x to y
+        return x to (windowStartRef.value + y)
     }
 
     fun selectedText(): String {
-        val sel = selection ?: return ""
+        val sel = selectionAbs ?: return ""
         val (ax, ay) = sel.first
         val (bx, by) = sel.second
         val (sx, sy, ex, ey) = if (ay < by || (ay == by && ax <= bx)) {
@@ -495,14 +503,14 @@ fun TerminalScreen(
             listOf(bx, by, ax, ay)
         }
         return buildString {
-            for (y in sy..ey) {
-                val row = viewport.chars.getOrNull(y) ?: continue
-                val fromX = if (y == sy) sx.coerceIn(0, row.size) else 0
-                val toX = if (y == ey) ex.coerceIn(0, row.size) else row.size
+            for (absY in sy..ey) {
+                val row = viewModel.getLine(absY) ?: continue
+                val fromX = if (absY == sy) sx.coerceIn(0, row.size) else 0
+                val toX = if (absY == ey) ex.coerceIn(0, row.size) else row.size
                 if (fromX < toX && fromX < row.size) {
                     append(row.slice(fromX until toX.coerceAtMost(row.size)).joinToString("").trimEnd())
                 }
-                if (y != ey) append('\n')
+                if (absY != ey) append('\n')
             }
         }
     }
@@ -572,52 +580,64 @@ fun TerminalScreen(
                         val rows = (px.height / cellMetrics.lineHeight).toInt()
                             .coerceIn(8, 200)
                         viewModel.resizeIfNeeded(cols, rows)
-                        selection = null
                     }
-                    .pointerInput(terminalCols, terminalRows) {
-                        detectTapGestures(
-                            onTap = {
-                                if (selection != null) {
-                                    selection = null
-                                } else {
-                                    focusRequester.requestFocus()
-                                    keyboardController?.show()
+                    .pointerInput(terminalCols, terminalRows, cellMetrics) {
+                        // One gesture loop: tap, plain-drag scroll,
+                        // and long-press-hold select never fight.
+                        awaitEachGesture {
+                            val down = awaitFirstDown()
+                            // Race touch-slop (scroll) vs long-press
+                            // (select) vs lift (tap).
+                            var slop: PointerInputChange? = null
+                            var longPressed = false
+                            try {
+                                withTimeout(viewConfiguration.longPressTimeoutMillis) {
+                                    slop = awaitTouchSlopOrCancellation(down.id) { change, _ ->
+                                        change.consume()
+                                    }
                                 }
-                            },
-                            onLongPress = { offset ->
-                                val cell = cellOf(offset)
-                                selection = cell to cell
+                            } catch (_: TimeoutCancellationException) {
+                                longPressed = true
                             }
-                        )
-                    }
-                    .pointerInput(terminalCols, terminalRows) {
-                        detectDragGesturesAfterLongPress(
-                            onDragStart = { offset ->
-                                val cell = cellOf(offset)
-                                selection = cell to cell
-                            },
-                            onDrag = { change, _ ->
-                                val anchor = selection?.first ?: cellOf(change.position)
-                                selection = anchor to cellOf(change.position)
-                            }
-                        )
-                    }
-                    .pointerInput(selection, terminalRows) {
-                        // Plain drag scrolls (no long-press). While a
-                        // selection is active this detector is inert.
-                        detectDragGestures(
-                            onDragStart = { scrollAcc = 0f },
-                            onDrag = { _, amount ->
-                                if (selection == null) {
-                                    scrollAcc += -amount.y
-                                    val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
-                                    if (lines != 0) {
-                                        scrollAcc -= lines * cellMetrics.lineHeight
-                                        viewModel.addViewportOffset(lines)
+                            when {
+                                longPressed -> {
+                                    val anchor = cellOfAbs(down.position)
+                                    selectionAbs = anchor to anchor
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val move = event.changes.firstOrNull { it.id == down.id }
+                                            ?: break
+                                        if (!move.pressed) break
+                                        selectionAbs = anchor to cellOfAbs(move.position)
+                                        move.consume()
+                                    }
+                                }
+                                slop != null -> {
+                                    scrollAcc = 0f
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val move = event.changes.firstOrNull { it.id == down.id }
+                                            ?: break
+                                        if (!move.pressed) break
+                                        scrollAcc += -move.positionChange().y
+                                        val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
+                                        if (lines != 0) {
+                                            scrollAcc -= lines * cellMetrics.lineHeight
+                                            viewModel.addViewportOffset(lines)
+                                        }
+                                        move.consume()
+                                    }
+                                }
+                                else -> {
+                                    if (selectionRef.value != null) {
+                                        selectionAbs = null
+                                    } else {
+                                        focusRequester.requestFocus()
+                                        keyboardController?.show()
                                     }
                                 }
                             }
-                        )
+                        }
                     }
             ) {
                 TerminalCanvas(
@@ -627,7 +647,7 @@ fun TerminalScreen(
                     cursorPosition = viewport.cursorX to viewport.cursorY,
                     placedImages = placedImages,
                     windowStartLine = viewport.windowStart,
-                    selection = selection,
+                    selectionAbs = selectionAbs,
                     textSizePx = cellMetrics.textSizePx,
                     cellWidth = cellMetrics.charWidth,
                     cellHeight = cellMetrics.lineHeight,
@@ -643,7 +663,7 @@ fun TerminalScreen(
                     maxOffset = viewport.maxOffset,
                     visibleFraction = viewport.chars.size.toFloat() /
                         viewport.totalLines.toFloat().coerceAtLeast(1f),
-                    onScrollTo = { viewModel.setViewportOffset(it); selection = null },
+                    onScrollTo = { viewModel.setViewportOffset(it) },
                     modifier = Modifier
                         .align(Alignment.CenterEnd)
                         .fillMaxHeight()
@@ -704,7 +724,7 @@ fun TerminalScreen(
                     .padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                if (selection != null) {
+                if (selectionAbs != null) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center,
@@ -716,14 +736,14 @@ fun TerminalScreen(
                                 clipboard.setText(AnnotatedString(text))
                                 Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                             }
-                            selection = null
+                            selectionAbs = null
                         }) {
                             Icon(Icons.Default.ContentCopy, contentDescription = null)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Copy")
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        OutlinedButton(onClick = { selection = null }) {
+                        OutlinedButton(onClick = { selectionAbs = null }) {
                             Text("Cancel")
                         }
                     }
@@ -775,7 +795,7 @@ fun TerminalScreen(
                     // Jump back to the live view when scrolled up.
                     if (viewport.offset > 0) {
                         SmallFloatingActionButton(
-                            onClick = { viewModel.setViewportOffset(0); selection = null }
+                            onClick = { viewModel.setViewportOffset(0) }
                         ) {
                             Text("↓")
                         }
@@ -834,7 +854,7 @@ fun TerminalCanvas(
     cursorPosition: Pair<Int, Int>,
     placedImages: List<PlacedImage>,
     windowStartLine: Int,
-    selection: Pair<Pair<Int, Int>, Pair<Int, Int>>?,
+    selectionAbs: Pair<Pair<Int, Int>, Pair<Int, Int>>?,
     textSizePx: Float,
     cellWidth: Float,
     cellHeight: Float,
@@ -921,8 +941,8 @@ fun TerminalCanvas(
             }
         }
 
-        // Draw text selection
-        selection?.let { sel ->
+        // Draw text selection (absolute lines mapped into the window).
+        selectionAbs?.let { sel ->
             val (ax, ay) = sel.first
             val (bx, by) = sel.second
             val (sx, sy, ex, ey) = if (ay < by || (ay == by && ax <= bx)) {
@@ -930,9 +950,11 @@ fun TerminalCanvas(
             } else {
                 listOf(bx, by, ax, ay)
             }
-            for (y in sy.coerceIn(0, buffer.size - 1)..ey.coerceIn(0, buffer.size - 1)) {
-                val fromX = (if (y == sy) sx else 0).coerceIn(0, cols)
-                val toX = (if (y == ey) ex else cols).coerceIn(0, cols)
+            for (absY in sy..ey) {
+                val y = absY - windowStartLine
+                if (y !in buffer.indices) continue
+                val fromX = (if (absY == sy) sx else 0).coerceIn(0, cols)
+                val toX = (if (absY == ey) ex else cols).coerceIn(0, cols)
                 if (fromX <= toX) {
                     drawRect(
                         color = Color(0xFF3390FF),

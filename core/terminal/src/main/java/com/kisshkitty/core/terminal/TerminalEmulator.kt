@@ -834,6 +834,13 @@ class TerminalEmulator(
 
     fun getScrollbackSize(): Int = scrollback.size
 
+    /** Absolute line content (scrollback + grid), or null if out of range. */
+    fun getAbsoluteLine(absLine: Int): CharArray? {
+        if (absLine < 0) return null
+        return if (absLine < scrollback.size) scrollback[absLine].chars
+        else buffer.getOrNull(absLine - scrollback.size)
+    }
+
     fun getBuffer(): Array<CharArray> = buffer
     fun getColors(): Array<IntArray> = fgColors
     fun getCursorX(): Int = cursorX
