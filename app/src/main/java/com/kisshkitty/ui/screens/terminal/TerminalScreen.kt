@@ -688,28 +688,36 @@ fun TerminalScreen(
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
-                    // Consume-and-clear: everything still in the field was
-                    // already sent, so only the fresh suffix is new input.
-                    // (This also makes IME full-replacements harmless: no
-                    // phantom backspaces, no re-sent history.)
-                    val fresh = if (newValue.startsWith(INPUT_SENTINEL)) {
-                        newValue.substring(INPUT_SENTINEL.length)
+                    // Accumulate: commits stick so the IME never desyncs
+                    // (reverting every keystroke freezes Gboard after a
+                    // couple of chars). Resets happen only on line submit
+                    // or full clear, like a real line discipline.
+                    val old = inputText
+                    if (newValue.isEmpty()) {
+                        // Sentinel itself deleted: real Backspace, then
+                        // restore it so the key keeps working.
+                        if (old.isNotEmpty()) viewModel.sendInput("\b")
+                        inputText = INPUT_SENTINEL
                     } else {
-                        newValue
+                        val common = newValue.commonPrefixWith(old).length
+                        val added = newValue.substring(common)
+                        if (common == 0) {
+                            // Total replacement (IME rewrote the field):
+                            // old content was already sent when typed, so
+                            // send only the new text, no phantom backspaces.
+                            viewModel.sendInput(
+                                added.replace("\r\n", "\r").replace('\n', '\r')
+                            )
+                        } else {
+                            repeat(old.length - common) { viewModel.sendInput("\b") }
+                            if (added.isNotEmpty()) {
+                                viewModel.sendInput(
+                                    added.replace("\r\n", "\r").replace('\n', '\r')
+                                )
+                            }
+                        }
+                        inputText = if (newValue.length > 512) INPUT_SENTINEL else newValue
                     }
-                    if (fresh.isNotEmpty()) {
-                        // Normalize newlines (stray \r\n must not double).
-                        // Enter itself normally arrives via onSend below;
-                        // this is only a fallback for keyboards that commit
-                        // raw newlines (possibly several at once).
-                        viewModel.sendInput(
-                            fresh.replace("\r\n", "\r").replace('\n', '\r')
-                        )
-                    } else if (newValue.isEmpty()) {
-                        // The sentinel itself was deleted: real Backspace.
-                        viewModel.sendInput("\b")
-                    }
-                    inputText = INPUT_SENTINEL
                 },
                 modifier = Modifier
                     .focusRequester(focusRequester)
@@ -725,7 +733,10 @@ fun TerminalScreen(
                     imeAction = ImeAction.Send
                 ),
                 keyboardActions = KeyboardActions(
-                    onSend = { viewModel.sendInput("\r") }
+                    onSend = {
+                        viewModel.sendInput("\r")
+                        inputText = INPUT_SENTINEL
+                    }
                 ),
                 singleLine = true,
                 cursorBrush = SolidColor(Color.Transparent),
