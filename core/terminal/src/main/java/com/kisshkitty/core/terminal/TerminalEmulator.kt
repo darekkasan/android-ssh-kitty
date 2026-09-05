@@ -742,6 +742,28 @@ class TerminalEmulator(
 
     fun resize(newCols: Int, newRows: Int) {
         if (newCols == cols && newRows == rows) return
+        // Shrinking rows must not kill lines: the top rows that no
+        // longer fit move into the scrollback (chronological order kept,
+        // cursor stays on the newest content).
+        if (newRows < rows) {
+            val drop = (buffer.size - newRows).coerceIn(0, buffer.size)
+            for (y in 0 until drop) {
+                scrollback.addLast(
+                    ScrollLine(
+                        buffer[y].copyOf(),
+                        fgColors[y].copyOf(),
+                        bgColors[y].copyOf()
+                    )
+                )
+            }
+            while (scrollback.size > MAX_SCROLLBACK) scrollback.removeFirst()
+            buffer = buffer.drop(drop).toTypedArray()
+            fgColors = fgColors.drop(drop).toTypedArray()
+            bgColors = bgColors.drop(drop).toTypedArray()
+            attributes = attributes.drop(drop).toTypedArray()
+            rows = buffer.size
+            cursorY = (cursorY - drop).coerceAtLeast(0)
+        }
         // Copy content into the new grid using real array bounds
         // (never the cols/rows fields, which may already disagree).
         val newBuffer = Array(newRows) { y ->

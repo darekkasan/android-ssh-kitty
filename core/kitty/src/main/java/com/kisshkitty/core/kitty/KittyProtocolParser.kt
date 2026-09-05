@@ -49,6 +49,11 @@ class KittyProtocolParser {
         const val ACTION_FRAME = "f"
         const val ACTION_ANIMATE = "a"
         const val ACTION_COMPOSE = "c"
+
+        /** Largest single upload kept in memory (bytes). */
+        const val MAX_PENDING_BYTES = 64 * 1024 * 1024
+        /** Cap on stored images (placed refs keep their bitmaps anyway). */
+        const val MAX_STORED_IMAGES = 64
     }
 
     /** Placement of an image, resolved without pixel metrics. */
@@ -158,7 +163,12 @@ class KittyProtocolParser {
         }
 
         // Resolve which upload chain this chunk belongs to.
-        val chunkOnlyKeys = params.keys.all { it == "m" || it == "q" || it == "a" }
+        // Continuations carry (almost) no control keys; anything without
+        // image keys that is not a known continuation is garbage
+        // (e.g. an echoed protocol response) and must be ignored so it
+        // can neither spawn responses nor poison pending uploads.
+        // ('a' alone doesn't count: frame continuations repeat a=f.)
+        val hasImageKeys = params.keys.any { it != "m" && it != "q" && it != "a" }
         var chainId: Int? = null
         var chainParams = params
         if (params.containsKey("i")) {
@@ -171,12 +181,15 @@ class KittyProtocolParser {
                     numbers.getOrPut(num) { mutableListOf() }.add(chainId!!)
                 }
             }
-        } else if (chunkOnlyKeys) {
-            chainId = lastChainId
-            val first = chainId?.let { pending[it] }
-            if (first != null) chainParams = first.params
+        } else if (!hasImageKeys) {
+            val cid = lastChainId
+            val state = cid?.let { pending[it] } ?: return emptyList()
+            chainId = cid
+            chainParams = state.params
+        } else {
+            // Anonymous new upload (single chunk or first chunk).
+            chainId = 0
         }
-        // Anonymous single-chunk upload.
         if (chainId == null) chainId = 0
 
         val more = params["m"]?.toIntOrNull() ?: 0
@@ -190,18 +203,29 @@ class KittyProtocolParser {
 
         if (more == 1) {
             val state = pending.getOrPut(chainId) { PendingUpload(chainParams) }
-            if (state.params !== chainParams && pending[chainId]?.data?.size() == 0) {
-                state.params = chainParams
-            }
             state.data.write(data)
+            if (state.data.size() > MAX_PENDING_BYTES) {
+                pending.remove(chainId)
+                if (chainId == lastChainId) lastChainId = null
+                return err(quiet, chainId, "ENOSPC: upload too large")
+            }
             lastChainId = chainId
             return emptyList()
         }
 
-        // Final chunk.
-        val first = pending.remove(chainId)
-        if (chainId == lastChainId) lastChainId = null
-        val effective = if (first != null && chunkOnlyKeys) first.params else chainParams
+        // Final chunk. A fresh single-chunk upload (full keys, no m key)
+        // must not inherit a stale aborted chain.
+        val freshSingle = hasImageKeys && !params.containsKey("m")
+        val first = if (freshSingle) {
+            pending.remove(chainId)
+            if (chainId == lastChainId) lastChainId = null
+            null
+        } else {
+            pending.remove(chainId).also {
+                if (chainId == lastChainId) lastChainId = null
+            }
+        }
+        val effective = if (first != null) first.params else chainParams
         val complete = ByteArrayOutputStream().also { out ->
             first?.data?.writeTo(out)
             out.write(data)
@@ -263,6 +287,12 @@ class KittyProtocolParser {
         )
         if (imageId != 0) {
             images[imageId] = image
+            while (images.size > MAX_STORED_IMAGES) {
+                val eldest = images.keys.firstOrNull() ?: break
+                if (eldest == imageId) break
+                images.remove(eldest)
+                numbers.values.forEach { it.remove(eldest) }
+            }
         }
 
         // Frames are stored like plain images but never auto-displayed.

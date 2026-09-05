@@ -1,7 +1,10 @@
 package com.kisshkitty.ui.screens.terminal
 
+import android.content.Context
+import android.content.Intent
 import android.graphics.Typeface
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -51,7 +54,9 @@ import com.kisshkitty.core.terminal.TerminalEmulator
 import com.kisshkitty.core.ssh.SshConfig
 import com.kisshkitty.core.ssh.SshConnectionManager
 import com.kisshkitty.data.HostRepository
+import com.kisshkitty.service.SshForegroundService
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -64,7 +69,8 @@ import javax.inject.Inject
 @HiltViewModel
 class TerminalViewModel @Inject constructor(
     private val sshConnectionManager: SshConnectionManager,
-    private val hostRepository: HostRepository
+    private val hostRepository: HostRepository,
+    @ApplicationContext private val appContext: Context
 ) : ViewModel() {
 
     private val _terminalState = MutableStateFlow<TerminalState>(TerminalState.Disconnected)
@@ -109,6 +115,7 @@ class TerminalViewModel @Inject constructor(
             result.fold(
                 onSuccess = { connection ->
                     _terminalState.value = TerminalState.Connected(config.host)
+                    startForegroundService()
                     startReadingOutput()
                 },
                 onFailure = { error ->
@@ -304,6 +311,10 @@ class TerminalViewModel @Inject constructor(
         refreshViewport()
     }
 
+    fun addViewportOffset(deltaLines: Int) {
+        if (deltaLines != 0) setViewportOffset(viewportOffset + deltaLines)
+    }
+
     fun setCellMetrics(charWidthPx: Float, lineHeightPx: Float) {
         cellW = charWidthPx
         cellH = lineHeightPx
@@ -340,8 +351,28 @@ class TerminalViewModel @Inject constructor(
 
     fun disconnect() {
         readingJob?.cancel()
+        stopForegroundService()
         sshConnectionManager.disconnect()
         _terminalState.value = TerminalState.Disconnected
+    }
+
+    /** Keep the process alive in the background so the session survives. */
+    private fun startForegroundService() {
+        try {
+            val intent = Intent(appContext, SshForegroundService::class.java)
+                .setAction(SshForegroundService.ACTION_START)
+            ContextCompat.startForegroundService(appContext, intent)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun stopForegroundService() {
+        try {
+            val intent = Intent(appContext, SshForegroundService::class.java)
+                .setAction(SshForegroundService.ACTION_STOP)
+            appContext.startService(intent)
+        } catch (_: Exception) {
+        }
     }
 
     fun resizeIfNeeded(cols: Int, rows: Int) {
@@ -418,6 +449,7 @@ fun TerminalScreen(
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
     var selection by remember { mutableStateOf<Pair<Pair<Int, Int>, Pair<Int, Int>>?>(null) }
+    var scrollAcc by remember { mutableFloatStateOf(0f) }
 
     val density = LocalDensity.current
     // Monospace cell metrics. The terminal grid is derived from the font,
@@ -540,6 +572,7 @@ fun TerminalScreen(
                         val rows = (px.height / cellMetrics.lineHeight).toInt()
                             .coerceIn(8, 200)
                         viewModel.resizeIfNeeded(cols, rows)
+                        selection = null
                     }
                     .pointerInput(terminalCols, terminalRows) {
                         detectTapGestures(
@@ -566,6 +599,23 @@ fun TerminalScreen(
                             onDrag = { change, _ ->
                                 val anchor = selection?.first ?: cellOf(change.position)
                                 selection = anchor to cellOf(change.position)
+                            }
+                        )
+                    }
+                    .pointerInput(selection, terminalRows) {
+                        // Plain drag scrolls (no long-press). While a
+                        // selection is active this detector is inert.
+                        detectDragGestures(
+                            onDragStart = { scrollAcc = 0f },
+                            onDrag = { _, amount ->
+                                if (selection == null) {
+                                    scrollAcc += -amount.y
+                                    val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
+                                    if (lines != 0) {
+                                        scrollAcc -= lines * cellMetrics.lineHeight
+                                        viewModel.addViewportOffset(lines)
+                                    }
+                                }
                             }
                         )
                     }
@@ -609,21 +659,27 @@ fun TerminalScreen(
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
-                    val common = newValue.commonPrefixWith(inputText).length
-                    val deleted = inputText.length - common
-                    val added = newValue.substring(common)
-                    repeat(deleted) {
+                    // Consume-and-clear: everything still in the field was
+                    // already sent, so only the fresh suffix is new input.
+                    // (This also makes IME full-replacements harmless: no
+                    // phantom backspaces, no re-sent history.)
+                    var fresh = if (newValue.startsWith(INPUT_SENTINEL)) {
+                        newValue.substring(INPUT_SENTINEL.length)
+                    } else {
+                        newValue
+                    }
+                    val newlineAt = fresh.indexOfFirst { it == '\n' || it == '\r' }
+                    if (newlineAt != -1) {
+                        val before = fresh.substring(0, newlineAt)
+                        if (before.isNotEmpty()) viewModel.sendInput(before)
+                        viewModel.sendInput("\r")
+                    } else if (fresh.isNotEmpty()) {
+                        viewModel.sendInput(fresh)
+                    } else if (newValue.isEmpty()) {
+                        // The sentinel itself was deleted: real Backspace.
                         viewModel.sendInput("\b")
                     }
-                    if (added.contains("\n") || added.contains("\r")) {
-                        viewModel.sendInput("\r")
-                        inputText = INPUT_SENTINEL
-                    } else {
-                        if (added.isNotEmpty()) {
-                            viewModel.sendInput(added)
-                        }
-                        inputText = if (newValue.isEmpty()) INPUT_SENTINEL else newValue
-                    }
+                    inputText = INPUT_SENTINEL
                 },
                 modifier = Modifier
                     .focusRequester(focusRequester)
@@ -687,7 +743,8 @@ fun TerminalScreen(
                                 val text = if (viewModel.isBracketedPaste()) {
                                     "\u001B[200~$clip\u001B[201~"
                                 } else {
-                                    clip
+                                    // Bare LFs would staircase: send CRs.
+                                    clip.replace("\r\n", "\r").replace('\n', '\r')
                                 }
                                 viewModel.sendInput(text)
                             }
