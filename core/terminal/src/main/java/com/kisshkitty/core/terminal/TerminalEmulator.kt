@@ -258,17 +258,19 @@ class TerminalEmulator(
     /**
      * Advance the cursor for a placed image of [placeCols] x [placeRows]
      * cells (Kitty cursor movement policy: move after placement).
+     * Clamped to the grid, never scrolls: scrolling is the shell's job
+     * (clients print newlines after images). Matches xterm's behavior;
+     * scrolling here would shred the layout on every image.
      */
     fun advanceForImage(placeCols: Int, placeRows: Int) {
         cursorX += placeCols.coerceAtLeast(0)
         cursorY += (placeRows - 1).coerceAtLeast(0)
-        while (cursorX >= cols) {
-            cursorX -= cols
-            lineFeed()
+        if (cols > 0) {
+            cursorY += cursorX / cols
+            cursorX %= cols
         }
-        while (cursorY >= rows) {
-            lineFeed()
-        }
+        cursorX = cursorX.coerceIn(0, (cols - 1).coerceAtLeast(0))
+        cursorY = cursorY.coerceIn(0, (rows - 1).coerceAtLeast(0))
     }
 
     private fun parseEscapeSequence(text: String, startIndex: Int): ParseResult {
@@ -744,7 +746,9 @@ class TerminalEmulator(
         if (newCols == cols && newRows == rows) return
         // Shrinking rows must not kill lines: the top rows that no
         // longer fit move into the scrollback (chronological order kept,
-        // cursor stays on the newest content).
+        // cursor stays on the newest content). Growing pulls recently
+        // scrolled-off rows back first, padding blanks on top so live
+        // content stays pinned to the bottom.
         if (newRows < rows) {
             val drop = (buffer.size - newRows).coerceIn(0, buffer.size)
             for (y in 0 until drop) {
@@ -763,6 +767,24 @@ class TerminalEmulator(
             attributes = attributes.drop(drop).toTypedArray()
             rows = buffer.size
             cursorY = (cursorY - drop).coerceAtLeast(0)
+        } else if (newRows > buffer.size) {
+            val add = newRows - buffer.size
+            val take = minOf(add, scrollback.size)
+            val pulled = ArrayList<ScrollLine>(take)
+            repeat(take) {
+                pulled.add(0, scrollback.removeLast())
+            }
+            val blanks = add - take
+            buffer = Array(blanks) { CharArray(cols) { ' ' } } +
+                pulled.map { it.chars }.toTypedArray() + buffer
+            fgColors = Array(blanks) { IntArray(cols) { currentFg } } +
+                pulled.map { it.fg }.toTypedArray() + fgColors
+            bgColors = Array(blanks) { IntArray(cols) { currentBg } } +
+                pulled.map { it.bg }.toTypedArray() + bgColors
+            attributes = Array(blanks) { IntArray(cols) { 0 } } +
+                Array(take) { IntArray(cols) { 0 } } + attributes
+            rows = buffer.size
+            cursorY += add
         }
         // Copy content into the new grid using real array bounds
         // (never the cols/rows fields, which may already disagree).

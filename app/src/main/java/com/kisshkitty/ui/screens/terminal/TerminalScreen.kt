@@ -391,8 +391,20 @@ class TerminalViewModel @Inject constructor(
 
     fun resizeIfNeeded(cols: Int, rows: Int) {
         if (cols != terminalEmulator.getCols() || rows != terminalEmulator.getRows()) {
+            val oldRows = terminalEmulator.getRows()
+            val sbBefore = terminalEmulator.getScrollbackSize()
             terminalEmulator.resize(cols, rows)
             sshConnectionManager.resizeTerminal(cols, rows)
+            // Growth pads blanks on top (after pulling scrollback back):
+            // shift grid-anchored images down so they stay glued.
+            val sbAfter = terminalEmulator.getScrollbackSize()
+            val blankPad = (terminalEmulator.getRows() - oldRows).coerceAtLeast(0) -
+                (sbBefore - sbAfter).coerceAtLeast(0)
+            if (blankPad > 0) {
+                _placedImages.value = _placedImages.value.map {
+                    if (it.absLine >= sbAfter) it.copy(absLine = it.absLine + blankPad) else it
+                }
+            }
             refreshViewport()
         }
     }
