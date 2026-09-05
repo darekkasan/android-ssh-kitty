@@ -63,6 +63,7 @@ import com.kisshkitty.data.HostRepository
 import com.kisshkitty.service.SshForegroundService
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -134,12 +135,19 @@ class TerminalViewModel @Inject constructor(
     private fun startReadingOutput() {
         readingJob = viewModelScope.launch {
             while (sshConnectionManager.isConnected()) {
-                val data = withContext(Dispatchers.IO) {
-                    sshConnectionManager.readFromTerminal()
-                }
-                if (data != null) {
-                    val text = String(data)
-                    processTerminalOutput(text)
+                try {
+                    val data = withContext(Dispatchers.IO) {
+                        sshConnectionManager.readFromTerminal()
+                    }
+                    if (data != null) {
+                        val text = String(data)
+                        processTerminalOutput(text)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // Never let one bad chunk silently kill the loop.
+                    e.printStackTrace()
                 }
                 delay(16)
             }
@@ -503,6 +511,11 @@ fun TerminalScreen(
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
     var scrollAcc by remember { mutableFloatStateOf(0f) }
+    // Explicit select mode: the visible field only becomes focusable
+    // here, so typing focus is never stolen and selection handles
+    // (which require focus) always work inside the mode.
+    var selectMode by remember { mutableStateOf(false) }
+    val visibleFocus = remember { FocusRequester() }
 
     val density = LocalDensity.current
     // Monospace cell metrics. The terminal grid is derived from the font,
@@ -565,13 +578,22 @@ fun TerminalScreen(
     // Fresh read for gesture guards without relaunch churn.
     val fieldRef = rememberUpdatedState(fieldValue)
 
-    fun selectedText(): String {
-        val sel = fieldValue.selection
-        if (sel.collapsed) return ""
-        return fieldValue.annotatedString
-            .subSequence(sel.start, sel.end).toString()
-            .split('\n')
-            .joinToString("\n") { it.trimEnd() }
+    fun exitSelectMode() {
+        selectMode = false
+        fieldValue = fieldValue.copy(selection = TextRange.Zero)
+        focusRequester.requestFocus()
+        keyboardController?.show()
+    }
+
+    // Focus the visible field once it is focusable in select mode.
+    // (Read-only never opens the keyboard.)
+    LaunchedEffect(selectMode) {
+        if (selectMode) {
+            kotlinx.coroutines.delay(150)
+            try {
+                visibleFocus.requestFocus()
+            } catch (_: Exception) {}
+        }
     }
 
     // Report metrics for image cell resolution, then fit the grid.
@@ -649,7 +671,9 @@ fun TerminalScreen(
                     .pointerInput(Unit) {
                         detectTapGestures(
                             onTap = {
-                                if (!fieldRef.value.selection.collapsed) {
+                                if (selectMode) {
+                                    exitSelectMode()
+                                } else if (!fieldRef.value.selection.collapsed) {
                                     fieldValue = fieldValue.copy(selection = TextRange.Zero)
                                 } else {
                                     focusRequester.requestFocus()
@@ -659,12 +683,12 @@ fun TerminalScreen(
                         )
                     }
                     .pointerInput(Unit) {
-                        // Plain drag scrolls. While the system selection is
-                        // active the drag belongs to it, so stay out.
+                        // Plain drag scrolls. Inside select mode (or with an
+                        // active selection) the drag belongs to selection.
                         detectDragGestures(
                             onDragStart = { scrollAcc = 0f },
                             onDrag = { _, amount ->
-                                if (fieldRef.value.selection.collapsed) {
+                                if (!selectMode && fieldRef.value.selection.collapsed) {
                                     scrollAcc += amount.y
                                     val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
                                     if (lines != 0) {
@@ -684,7 +708,8 @@ fun TerminalScreen(
                     onValueChange = { fieldValue = it },
                     modifier = Modifier
                         .fillMaxSize()
-                        .focusProperties { canFocus = false },
+                        .focusRequester(visibleFocus)
+                        .focusProperties { canFocus = selectMode },
                     readOnly = true,
                     enabled = true,
                     textStyle = TextStyle(
@@ -766,7 +791,8 @@ fun TerminalScreen(
                     .onPlaced { isTextFieldPlaced = true },
                 // Password mode: no suggestions / autocorrect on the terminal.
                 // Enter is an IME action so it fires reliably every time
-                // instead of depending on text commits.
+                // instead of depending on text commits. Multi-line: a 1dp
+                // single-line field confuses IMEs and freezes input.
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.Password,
                     autoCorrect = false,
@@ -778,7 +804,7 @@ fun TerminalScreen(
                         inputText = INPUT_SENTINEL
                     }
                 ),
-                singleLine = true,
+                singleLine = false,
                 cursorBrush = SolidColor(Color.Transparent),
                 textStyle = TextStyle(color = Color.Transparent)
             )
@@ -808,16 +834,14 @@ fun TerminalScreen(
                                 clipboard.setText(AnnotatedString(text))
                                 Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                             }
-                            fieldValue = fieldValue.copy(selection = TextRange.Zero)
+                            exitSelectMode()
                         }) {
                             Icon(Icons.Default.ContentCopy, contentDescription = null)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Copy")
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        OutlinedButton(onClick = {
-                            fieldValue = fieldValue.copy(selection = TextRange.Zero)
-                        }) {
+                        OutlinedButton(onClick = { exitSelectMode() }) {
                             Text("Cancel")
                         }
                     }
@@ -872,6 +896,19 @@ fun TerminalScreen(
                             onClick = { viewModel.setViewportOffset(0) }
                         ) {
                             Text("↓")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    // Explicit select mode: standard handles + toolbar,
+                    // focusable only here so typing is never disturbed.
+                    if (selectMode) {
+                        Button(onClick = { exitSelectMode() }) {
+                            Text("Done")
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    } else {
+                        OutlinedButton(onClick = { selectMode = true }) {
+                            Text("Select")
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                     }

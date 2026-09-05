@@ -86,18 +86,29 @@ class SshConnectionManager @Inject constructor() {
     }
 
     fun writeToTerminal(data: ByteArray) {
-        outputStream?.write(data)
-        outputStream?.flush()
+        try {
+            outputStream?.write(data)
+            outputStream?.flush()
+        } catch (e: Exception) {
+            Log.e("SshConnectionManager", "Write failed", e)
+        }
     }
 
     fun readFromTerminal(): ByteArray? {
         return try {
-            val available = inputStream?.available() ?: 0
-            if (available > 0) {
-                val buffer = ByteArray(available)
-                inputStream?.read(buffer)
-                buffer
-            } else null
+            val input = inputStream ?: return null
+            val available = input.available()
+            if (available <= 0) return null
+            // Read in full: InputStream.read() may return short.
+            val size = available.coerceAtMost(MAX_READ_BYTES)
+            val buffer = ByteArray(size)
+            var total = 0
+            while (total < size) {
+                val r = input.read(buffer, total, size - total)
+                if (r <= 0) break
+                total += r
+            }
+            if (total <= 0) null else buffer.copyOf(total)
         } catch (e: Exception) {
             null
         }
@@ -145,3 +156,5 @@ data class SshConnection(
     val session: Session,
     val shell: Session.Shell
 )
+
+private const val MAX_READ_BYTES = 65536
