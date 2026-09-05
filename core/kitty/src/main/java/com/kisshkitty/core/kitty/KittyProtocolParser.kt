@@ -139,7 +139,7 @@ class KittyProtocolParser {
         val hasNum = params.containsKey("I")
 
         if (hasI && hasNum) {
-            return err(quiet, 0, "EINVAL: i and I must not be combined")
+            return err(quiet, 0, "EINVAL: i and I must not be combined", true)
         }
 
         return when (action) {
@@ -164,9 +164,12 @@ class KittyProtocolParser {
         quiet: Int
     ): List<KittyEvent> {
         val medium = params["t"] ?: "d"
+        // Correlatable replies need an explicit i/I (like xterm); without
+        // one there is nobody to answer, so stay silent.
+        val correlate = params.containsKey("i") || params.containsKey("I")
         if (medium != "d") {
             val id = params["i"]?.toIntOrNull() ?: 0
-            return err(quiet, id, "EBADMEDIUM: only direct (t=d) uploads are supported")
+            return err(quiet, id, "EBADMEDIUM: only direct (t=d) uploads are supported", correlate)
         }
 
         // Resolve which upload chain this chunk belongs to.
@@ -205,7 +208,7 @@ class KittyProtocolParser {
         } catch (e: Exception) {
             pending.remove(chainId)
             if (chainId == lastChainId) lastChainId = null
-            return err(quiet, chainId ?: 0, "EINVAL: bad base64 payload")
+            return err(quiet, chainId ?: 0, "EINVAL: bad base64 payload", correlate)
         }
 
         if (more == 1) {
@@ -214,7 +217,7 @@ class KittyProtocolParser {
             if (state.data.size() > MAX_PENDING_BYTES) {
                 pending.remove(chainId)
                 if (chainId == lastChainId) lastChainId = null
-                return err(quiet, chainId, "ENOSPC: upload too large")
+                return err(quiet, chainId, "ENOSPC: upload too large", correlate)
             }
             lastChainId = chainId
             return emptyList()
@@ -238,7 +241,7 @@ class KittyProtocolParser {
             out.write(data)
         }.toByteArray()
 
-        return finishLoad(effective, complete, action, quiet, chainId)
+        return finishLoad(effective, complete, action, quiet, chainId, correlate)
     }
 
     private fun finishLoad(
@@ -246,8 +249,12 @@ class KittyProtocolParser {
         data: ByteArray,
         action: String,
         quiet: Int,
-        chainId: Int
+        chainId: Int,
+        correlate: Boolean
     ): List<KittyEvent> {
+        // Empty transmit: nothing to store (xterm parity).
+        if (data.isEmpty() && action == ACTION_TRANSMIT) return emptyList()
+
         val format = params["f"]?.toIntOrNull() ?: FORMAT_RGBA
         val width = params["s"]?.toIntOrNull() ?: 0
         val height = params["v"]?.toIntOrNull() ?: 0
@@ -257,7 +264,7 @@ class KittyProtocolParser {
             raw = try {
                 InflaterInputStream(ByteArrayInputStream(data)).readBytes()
             } catch (e: Exception) {
-                return err(quiet, chainId, "EINVAL: bad zlib data")
+                return err(quiet, chainId, "EINVAL: bad zlib data", correlate)
             }
         }
 
@@ -266,11 +273,11 @@ class KittyProtocolParser {
             FORMAT_RGBA -> createRgbaBitmap(raw, width, height)
             FORMAT_PNG -> createPngBitmap(raw)
             else -> null
-        } ?: return err(quiet, chainId, "EINVAL: bad image data")
+        } ?: return err(quiet, chainId, "EINVAL: bad image data", correlate)
 
         // Query action: validate only, never store or display.
         if (action == ACTION_QUERY) {
-            return ok(quiet, chainId, null)
+            return ok(quiet, chainId, null, true)
         }
 
         val imageId = if (params.containsKey("i")) {
@@ -304,20 +311,20 @@ class KittyProtocolParser {
 
         // Frames are stored like plain images but never auto-displayed.
         if (action == ACTION_FRAME) {
-            return ok(quiet, imageId, null)
+            return ok(quiet, imageId, null, correlate)
         }
 
         if (action == ACTION_TRANSMIT) {
-            return ok(quiet, imageId, params["p"]?.toIntOrNull())
+            return ok(quiet, imageId, params["p"]?.toIntOrNull(), correlate)
         }
 
         // Transmit-and-display.
         if (params["U"]?.toIntOrNull() == 1) {
             // Virtual placement for Unicode placeholders: stored, not drawn.
-            return ok(quiet, imageId, params["p"]?.toIntOrNull())
+            return ok(quiet, imageId, params["p"]?.toIntOrNull(), correlate)
         }
         return listOf(KittyEvent.Show(image, placementOf(params))) +
-            ok(quiet, imageId, params["p"]?.toIntOrNull())
+            ok(quiet, imageId, params["p"]?.toIntOrNull(), correlate)
     }
 
     private fun placementOf(params: Map<String, String>): ShowOp {
@@ -340,6 +347,7 @@ class KittyProtocolParser {
     // ------------------------------------------------------------------
 
     private fun handlePut(params: Map<String, String>, quiet: Int): List<KittyEvent> {
+        val correlate = params.containsKey("i") || params.containsKey("I")
         val image: KittyImage? = when {
             params.containsKey("i") -> images[params["i"]?.toIntOrNull()]
             params.containsKey("I") -> {
@@ -349,14 +357,15 @@ class KittyProtocolParser {
             else -> null
         }
         if (image == null) {
+            if (!correlate) return emptyList()
             val id = params["i"]?.toIntOrNull() ?: 0
-            return err(quiet, id, "ENOENT: no image with the given id")
+            return err(quiet, id, "ENOENT: no image with the given id", true)
         }
         if (params["U"]?.toIntOrNull() == 1) {
-            return ok(quiet, image.id, params["p"]?.toIntOrNull())
+            return ok(quiet, image.id, params["p"]?.toIntOrNull(), correlate)
         }
         return listOf(KittyEvent.Show(image, placementOf(params))) +
-            ok(quiet, image.id, params["p"]?.toIntOrNull())
+            ok(quiet, image.id, params["p"]?.toIntOrNull(), correlate)
     }
 
     private fun handleDelete(params: Map<String, String>): List<KittyEvent> {
@@ -387,17 +396,19 @@ class KittyProtocolParser {
     }
 
     // ------------------------------------------------------------------
-    // Responses (q=1 suppresses OK, q=2 suppresses everything)
+    // Responses (q=1 suppresses OK, q=2 suppresses everything).
+    // Like xterm, only operations that named an id/number get answers;
+    // anonymous traffic stays silent so echoes can never cascade.
     // ------------------------------------------------------------------
 
-    private fun ok(quiet: Int, id: Int, placementId: Int?): List<KittyEvent> {
-        if (quiet >= 1) return emptyList()
+    private fun ok(quiet: Int, id: Int, placementId: Int?, respond: Boolean = true): List<KittyEvent> {
+        if (!respond || quiet >= 1) return emptyList()
         val extra = if (placementId != null && placementId != 0) ",p=$placementId" else ""
         return listOf(KittyEvent.Respond("$APC_START" + "Gi=$id$extra;OK$APC_END"))
     }
 
-    private fun err(quiet: Int, id: Int, message: String): List<KittyEvent> {
-        if (quiet >= 2) return emptyList()
+    private fun err(quiet: Int, id: Int, message: String, respond: Boolean = true): List<KittyEvent> {
+        if (!respond || quiet >= 2) return emptyList()
         return listOf(KittyEvent.Respond("$APC_START" + "Gi=$id;$message$APC_END"))
     }
 
