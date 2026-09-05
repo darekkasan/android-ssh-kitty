@@ -7,9 +7,6 @@ import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitTouchSlopOrCancellation
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
@@ -27,16 +24,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -44,9 +38,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -67,10 +67,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import kotlin.math.roundToInt
 import javax.inject.Inject
 
@@ -328,8 +326,6 @@ class TerminalViewModel @Inject constructor(
         cellH = lineHeightPx
     }
 
-    fun getLine(absLine: Int): CharArray? = terminalEmulator.getAbsoluteLine(absLine)
-
     fun isBracketedPaste(): Boolean = terminalEmulator.bracketedPaste
 
     fun sendInput(text: String) {
@@ -442,6 +438,54 @@ data class PlacedImage(
 
 private const val MAX_PLACED_IMAGES = 24
 
+/** Viewport grid as styled text (standard selection, cursor as inverse). */
+private fun buildTerminalAnnotated(
+    w: TerminalEmulator.EmulatorWindow
+): AnnotatedString {
+    return buildAnnotatedString {
+        for (y in w.chars.indices) {
+            val row = w.chars[y]
+            val fgRow = w.fg.getOrNull(y)
+            val bgRow = w.bg.getOrNull(y)
+            var x = 0
+            while (x < row.size) {
+                val isCursor = x == w.cursorX && y == w.cursorY
+                val fg = if (isCursor) {
+                    android.graphics.Color.BLACK
+                } else {
+                    fgRow?.getOrNull(x) ?: android.graphics.Color.WHITE
+                }
+                val bg = if (isCursor) {
+                    android.graphics.Color.WHITE
+                } else {
+                    bgRow?.getOrNull(x) ?: android.graphics.Color.BLACK
+                }
+                var x2 = x + 1
+                while (x2 < row.size) {
+                    val c2 = x2 == w.cursorX && y == w.cursorY
+                    val f2 = if (c2) {
+                        android.graphics.Color.BLACK
+                    } else {
+                        fgRow?.getOrNull(x2) ?: android.graphics.Color.WHITE
+                    }
+                    val b2 = if (c2) {
+                        android.graphics.Color.WHITE
+                    } else {
+                        bgRow?.getOrNull(x2) ?: android.graphics.Color.BLACK
+                    }
+                    if (f2 != fg || b2 != bg) break
+                    x2++
+                }
+                withStyle(SpanStyle(color = Color(fg), background = Color(bg))) {
+                    append(row.concatToString(x, x2))
+                }
+                x = x2
+            }
+            if (y != w.chars.lastIndex) append('\n')
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TerminalScreen(
@@ -458,10 +502,6 @@ fun TerminalScreen(
     var inputText by remember { mutableStateOf(INPUT_SENTINEL) }
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
-    // Selection in absolute lines (col, absLine) so it survives scrolling.
-    var selectionAbs by remember { mutableStateOf<Pair<Pair<Int, Int>, Pair<Int, Int>>?>(null) }
-    // Fresh read for gestures without relaunch churn.
-    val selectionRef = rememberUpdatedState(selectionAbs)
     var scrollAcc by remember { mutableFloatStateOf(0f) }
 
     val density = LocalDensity.current
@@ -481,45 +521,43 @@ fun TerminalScreen(
             baselineOffset = -fm.top
         )
     }
+    val terminalLineHeightSp = with(density) { cellMetrics.lineHeight.toSp() }
 
-    val terminalCols = if (viewport.chars.isNotEmpty()) viewport.chars[0].size else 80
-    val terminalRows = viewport.chars.size.coerceAtLeast(1)
-    // Always-fresh window start for gestures (no relaunch churn).
-    val windowStartRef = rememberUpdatedState(viewport.windowStart)
+    // Visible text (standard Android selection) + its selection state.
+    // Rebuilt whenever the viewport changes; the selection survives when
+    // the window didn't move and is cleared when it scrolled.
+    var fieldValue by remember { mutableStateOf(TextFieldValue(AnnotatedString(""))) }
+    var lastWindowStart by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(viewport) {
+        val annotated = buildTerminalAnnotated(viewport)
+        val reset = lastWindowStart != null && lastWindowStart != viewport.windowStart
+        lastWindowStart = viewport.windowStart
+        val sel = if (reset) {
+            TextRange.Zero
+        } else {
+            val s = fieldValue.selection
+            TextRange(
+                s.start.coerceIn(0, annotated.length),
+                s.end.coerceIn(0, annotated.length)
+            )
+        }
+        fieldValue = TextFieldValue(annotated, sel)
+    }
+    // Fresh read for gesture guards without relaunch churn.
+    val fieldRef = rememberUpdatedState(fieldValue)
+
+    fun selectedText(): String {
+        val sel = fieldValue.selection
+        if (sel.collapsed) return ""
+        return fieldValue.annotatedString
+            .subSequence(sel.start, sel.end).toString()
+            .split('\n')
+            .joinToString("\n") { it.trimEnd() }
+    }
 
     // Report metrics for image cell resolution, then fit the grid.
     LaunchedEffect(cellMetrics) {
         viewModel.setCellMetrics(cellMetrics.charWidth, cellMetrics.lineHeight)
-    }
-
-    fun cellOfAbs(offset: Offset): Pair<Int, Int> {
-        val x = (offset.x / cellMetrics.charWidth).toInt()
-            .coerceIn(0, (terminalCols - 1).coerceAtLeast(0))
-        val y = (offset.y / cellMetrics.lineHeight).toInt()
-            .coerceIn(0, (terminalRows - 1).coerceAtLeast(0))
-        return x to (windowStartRef.value + y)
-    }
-
-    fun selectedText(): String {
-        val sel = selectionAbs ?: return ""
-        val (ax, ay) = sel.first
-        val (bx, by) = sel.second
-        val (sx, sy, ex, ey) = if (ay < by || (ay == by && ax <= bx)) {
-            listOf(ax, ay, bx, by)
-        } else {
-            listOf(bx, by, ax, ay)
-        }
-        return buildString {
-            for (absY in sy..ey) {
-                val row = viewModel.getLine(absY) ?: continue
-                val fromX = if (absY == sy) sx.coerceIn(0, row.size) else 0
-                val toX = if (absY == ey) ex.coerceIn(0, row.size) else row.size
-                if (fromX < toX && fromX < row.size) {
-                    append(row.slice(fromX until toX.coerceAtMost(row.size)).joinToString("").trimEnd())
-                }
-                if (absY != ey) append('\n')
-            }
-        }
     }
 
     val clipboard = LocalClipboardManager.current
@@ -575,7 +613,8 @@ fun TerminalScreen(
                 .padding(paddingValues)
                 .imePadding()
         ) {
-            // Terminal display
+            // Terminal display: standard selectable text plus a
+            // transparent overlay for Kitty images.
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -588,79 +627,61 @@ fun TerminalScreen(
                             .coerceIn(8, 200)
                         viewModel.resizeIfNeeded(cols, rows)
                     }
-                    .pointerInput(terminalCols, terminalRows, cellMetrics) {
-                        // One gesture loop: tap, plain-drag scroll,
-                        // and long-press-hold select never fight.
-                        awaitEachGesture {
-                            val down = awaitFirstDown()
-                            // Race touch-slop (scroll) vs long-press
-                            // (select) vs lift (tap).
-                            var slop: PointerInputChange? = null
-                            var longPressed = false
-                            try {
-                                withTimeout(viewConfiguration.longPressTimeoutMillis) {
-                                    slop = awaitTouchSlopOrCancellation(down.id) { change, _ ->
-                                        change.consume()
-                                    }
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onTap = {
+                                if (!fieldRef.value.selection.collapsed) {
+                                    fieldValue = fieldValue.copy(selection = TextRange.Zero)
+                                } else {
+                                    focusRequester.requestFocus()
+                                    keyboardController?.show()
                                 }
-                            } catch (_: TimeoutCancellationException) {
-                                longPressed = true
                             }
-                            when {
-                                longPressed -> {
-                                    val anchor = cellOfAbs(down.position)
-                                    selectionAbs = anchor to anchor
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val move = event.changes.firstOrNull { it.id == down.id }
-                                            ?: break
-                                        if (!move.pressed) break
-                                        selectionAbs = anchor to cellOfAbs(move.position)
-                                        move.consume()
-                                    }
-                                }
-                                slop != null -> {
-                                    scrollAcc = 0f
-                                    while (true) {
-                                        val event = awaitPointerEvent()
-                                        val move = event.changes.firstOrNull { it.id == down.id }
-                                            ?: break
-                                        if (!move.pressed) break
-                                        // Content follows the finger: drag down
-                                        // reveals older lines above.
-                                        scrollAcc += move.positionChange().y
-                                        val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
-                                        if (lines != 0) {
-                                            scrollAcc -= lines * cellMetrics.lineHeight
-                                            viewModel.addViewportOffset(lines)
-                                        }
-                                        move.consume()
-                                    }
-                                }
-                                else -> {
-                                    if (selectionRef.value != null) {
-                                        selectionAbs = null
-                                    } else {
-                                        focusRequester.requestFocus()
-                                        keyboardController?.show()
+                        )
+                    }
+                    .pointerInput(Unit) {
+                        // Plain drag scrolls. While the system selection is
+                        // active the drag belongs to it, so stay out.
+                        detectDragGestures(
+                            onDragStart = { scrollAcc = 0f },
+                            onDrag = { _, amount ->
+                                if (fieldRef.value.selection.collapsed) {
+                                    scrollAcc += amount.y
+                                    val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
+                                    if (lines != 0) {
+                                        scrollAcc -= lines * cellMetrics.lineHeight
+                                        viewModel.addViewportOffset(lines)
                                     }
                                 }
                             }
-                        }
+                        )
                     }
             ) {
+                // Visible text with standard Android selection. Read-only:
+                // input keeps flowing through the hidden field, so this one
+                // never takes focus or opens the keyboard.
+                BasicTextField(
+                    value = fieldValue,
+                    onValueChange = { fieldValue = it },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .focusProperties { canFocus = false },
+                    readOnly = true,
+                    enabled = true,
+                    textStyle = TextStyle(
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = TERMINAL_FONT_SIZE,
+                        lineHeight = terminalLineHeightSp,
+                        letterSpacing = 0.sp,
+                        color = Color.White
+                    ),
+                    cursorBrush = SolidColor(Color.Transparent)
+                )
                 TerminalCanvas(
-                    buffer = viewport.chars,
-                    colors = viewport.fg,
-                    bgColors = viewport.bg,
-                    cursorPosition = viewport.cursorX to viewport.cursorY,
                     placedImages = placedImages,
                     windowStartLine = viewport.windowStart,
-                    selectionAbs = selectionAbs,
-                    textSizePx = cellMetrics.textSizePx,
                     cellWidth = cellMetrics.charWidth,
                     cellHeight = cellMetrics.lineHeight,
-                    baselineOffset = cellMetrics.baselineOffset,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -752,26 +773,32 @@ fun TerminalScreen(
                     .padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                if (selectionAbs != null) {
+                if (!fieldValue.selection.collapsed) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Button(onClick = {
-                            val text = selectedText()
+                            val sel = fieldValue.selection
+                            val text = fieldValue.annotatedString
+                                .subSequence(sel.start, sel.end).toString()
+                                .split('\n')
+                                .joinToString("\n") { it.trimEnd() }
                             if (text.isNotEmpty()) {
                                 clipboard.setText(AnnotatedString(text))
                                 Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                             }
-                            selectionAbs = null
+                            fieldValue = fieldValue.copy(selection = TextRange.Zero)
                         }) {
                             Icon(Icons.Default.ContentCopy, contentDescription = null)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Copy")
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        OutlinedButton(onClick = { selectionAbs = null }) {
+                        OutlinedButton(onClick = {
+                            fieldValue = fieldValue.copy(selection = TextRange.Zero)
+                        }) {
                             Text("Cancel")
                         }
                     }
@@ -830,7 +857,13 @@ fun TerminalScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                     }
                     SmallFloatingActionButton(
-                        onClick = { showKeys = !showKeys }
+                        onClick = {
+                            showKeys = !showKeys
+                            // Also a guaranteed path to bring the keyboard
+                            // back (taps may be consumed by the text).
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
+                        }
                     ) {
                         Icon(
                             if (showKeys) Icons.Default.KeyboardHide else Icons.Default.Keyboard,
@@ -876,23 +909,15 @@ fun TerminalScreen(
 
 @Composable
 fun TerminalCanvas(
-    buffer: Array<CharArray>,
-    colors: Array<IntArray>,
-    bgColors: Array<IntArray>,
-    cursorPosition: Pair<Int, Int>,
     placedImages: List<PlacedImage>,
     windowStartLine: Int,
-    selectionAbs: Pair<Pair<Int, Int>, Pair<Int, Int>>?,
-    textSizePx: Float,
     cellWidth: Float,
     cellHeight: Float,
-    baselineOffset: Float,
     modifier: Modifier = Modifier
 ) {
+    // Transparent overlay: text (with standard selection) is drawn by the
+    // read-only field below; only Kitty images live here.
     Canvas(modifier = modifier) {
-        if (buffer.isEmpty() || buffer[0].isEmpty()) return@Canvas
-        val cols = buffer[0].size
-
         fun drawPlaced(p: PlacedImage) {
             val bw = p.bitmap.width
             val bh = p.bitmap.height
@@ -913,100 +938,6 @@ fun TerminalCanvas(
         // Images with negative z-index go under the text.
         for (p in placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))) {
             if (p.zIndex < 0) drawPlaced(p)
-        }
-
-        // Background fills.
-        for (y in buffer.indices) {
-            val bgRow = bgColors.getOrNull(y) ?: continue
-            var x = 0
-            while (x < buffer[y].size) {
-                val bg = bgRow.getOrNull(x) ?: android.graphics.Color.BLACK
-                if (bg != android.graphics.Color.BLACK) {
-                    var x2 = x
-                    while (x2 < buffer[y].size &&
-                        (bgRow.getOrNull(x2) ?: android.graphics.Color.BLACK) == bg
-                    ) {
-                        x2++
-                    }
-                    drawRect(
-                        color = Color(bg),
-                        topLeft = Offset(x * cellWidth, y * cellHeight),
-                        size = androidx.compose.ui.geometry.Size(
-                            (x2 - x) * cellWidth,
-                            cellHeight
-                        )
-                    )
-                    x = x2
-                } else {
-                    x++
-                }
-            }
-        }
-
-        drawIntoCanvas { canvas ->
-            val paint = android.graphics.Paint().apply {
-                color = android.graphics.Color.WHITE
-                textSize = textSizePx
-                typeface = Typeface.MONOSPACE
-                isAntiAlias = true
-            }
-
-            // Draw terminal content. Cell geometry comes from the font,
-            // so glyphs fit their cells exactly.
-            for (y in buffer.indices) {
-                for (x in buffer[y].indices) {
-                    val char = buffer[y][x]
-                    if (char != ' ') {
-                        paint.color = colors[y][x]
-                        canvas.nativeCanvas.drawText(
-                            char.toString(),
-                            x * cellWidth,
-                            y * cellHeight + baselineOffset,
-                            paint
-                        )
-                    }
-                }
-            }
-        }
-
-        // Draw text selection (absolute lines mapped into the window).
-        selectionAbs?.let { sel ->
-            val (ax, ay) = sel.first
-            val (bx, by) = sel.second
-            val (sx, sy, ex, ey) = if (ay < by || (ay == by && ax <= bx)) {
-                listOf(ax, ay, bx, by)
-            } else {
-                listOf(bx, by, ax, ay)
-            }
-            for (absY in sy..ey) {
-                val y = absY - windowStartLine
-                if (y !in buffer.indices) continue
-                val fromX = (if (absY == sy) sx else 0).coerceIn(0, cols)
-                val toX = (if (absY == ey) ex else cols).coerceIn(0, cols)
-                if (fromX <= toX) {
-                    drawRect(
-                        color = Color(0xFF3390FF),
-                        topLeft = Offset(fromX * cellWidth, y * cellHeight),
-                        size = androidx.compose.ui.geometry.Size(
-                            (toX - fromX + 1) * cellWidth,
-                            cellHeight
-                        ),
-                        alpha = 0.35f
-                    )
-                }
-            }
-        }
-
-        // Draw cursor (-1 hides it: scrolled away or cursor hidden).
-        val cursorX = cursorPosition.first.coerceIn(0, (cols - 1).coerceAtLeast(0))
-        val cursorY = cursorPosition.second
-        if (cursorY in buffer.indices) {
-            drawRect(
-                color = Color.White,
-                topLeft = Offset(cursorX * cellWidth, cursorY * cellHeight),
-                size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight),
-                alpha = 0.5f
-            )
         }
 
         // Images with non-negative z-index go over the text.
