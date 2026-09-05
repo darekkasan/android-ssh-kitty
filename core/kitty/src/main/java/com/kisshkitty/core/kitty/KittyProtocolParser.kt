@@ -120,18 +120,43 @@ class KittyProtocolParser {
             return emptyList()
         }
         val content = sequence.removePrefix(APC_START).removeSuffix(APC_END)
+        // Control data and payload split at the first ';'. Metadata-only
+        // APCs without any ';' are normal: chafa opens uploads that way,
+        // and puts/deletes usually have no payload either.
         val separatorIndex = content.indexOf(';')
-        if (separatorIndex == -1) return emptyList()
+        val controlData: String
+        val payload: String
+        if (separatorIndex == -1) {
+            controlData = content
+            payload = ""
+        } else {
+            controlData = content.substring(0, separatorIndex)
+            payload = content.substring(separatorIndex + 1)
+        }
 
-        val params = parseControlData(content.substring(0, separatorIndex))
-        val payload = content.substring(separatorIndex + 1)
+        val params0 = parseControlData(controlData)
 
         // Foreign protocol responses (our own echoed replies, real
         // kitty replies, DA answers) always carry Gi and are never
         // client commands. Ignore them outright: parsing them as
         // anonymous uploads steals pending chunk state and the error
         // responses they spawn loop forever through pty echo.
-        if (params.containsKey("Gi")) return emptyList()
+        if (params0.containsKey("Gi")) return emptyList()
+
+        // The APC command code: every graphics sequence is ESC _ G ...,
+        // so the control data starts with a lone 'G'. Strip it, otherwise
+        // the first key parses as "Ga" and the action is lost.
+        val params = if (controlData.startsWith("G")) {
+            parseControlData(controlData.substring(1))
+        } else {
+            params0
+        }
+
+        // A response echo looks like i=<id>[,p=<pid>];<message> with no
+        // action key. No valid client command looks like that, so ignore
+        // it instead of treating it as an anonymous upload.
+        val hasAction = params.containsKey("a")
+        if (!hasAction && params.keys.all { it == "i" || it == "p" }) return emptyList()
 
         val action = params["a"] ?: ACTION_TRANSMIT
         val quiet = params["q"]?.toIntOrNull() ?: 0
@@ -191,11 +216,14 @@ class KittyProtocolParser {
                     numbers.getOrPut(num) { mutableListOf() }.add(chainId!!)
                 }
             }
-        } else if (!hasImageKeys) {
+        } else if (!hasImageKeys && params.containsKey("m")) {
             val cid = lastChainId
             val state = cid?.let { pending[it] } ?: return emptyList()
             chainId = cid
             chainParams = state.params
+        } else if (!hasImageKeys) {
+            // Marker-only chunk for no known chain: ignore.
+            return emptyList()
         } else {
             // Anonymous new upload (single chunk or first chunk).
             chainId = 0
@@ -206,9 +234,12 @@ class KittyProtocolParser {
         val data = try {
             Base64.decode(payload, Base64.DEFAULT)
         } catch (e: Exception) {
+            val eparams = pending[chainId]?.params ?: params
+            val equiet = eparams["q"]?.toIntOrNull() ?: quiet
+            val ecorrelate = eparams.containsKey("i") || eparams.containsKey("I")
             pending.remove(chainId)
             if (chainId == lastChainId) lastChainId = null
-            return err(quiet, chainId ?: 0, "EINVAL: bad base64 payload", correlate)
+            return err(equiet, chainId ?: 0, "EINVAL: bad base64 payload", ecorrelate)
         }
 
         if (more == 1) {
@@ -217,7 +248,9 @@ class KittyProtocolParser {
             if (state.data.size() > MAX_PENDING_BYTES) {
                 pending.remove(chainId)
                 if (chainId == lastChainId) lastChainId = null
-                return err(quiet, chainId, "ENOSPC: upload too large", correlate)
+                val eq = chainParams["q"]?.toIntOrNull() ?: quiet
+                val ec = chainParams.containsKey("i") || chainParams.containsKey("I")
+                return err(eq, chainId, "ENOSPC: upload too large", ec)
             }
             lastChainId = chainId
             return emptyList()
@@ -241,7 +274,13 @@ class KittyProtocolParser {
             out.write(data)
         }.toByteArray()
 
-        return finishLoad(effective, complete, action, quiet, chainId, correlate)
+        // Action/quiet/correlation come from the effective (first-chunk)
+        // params: the final chunk usually carries only m=0, which must
+        // not downgrade a=T to a silent transmit.
+        val finalAction = effective["a"] ?: ACTION_TRANSMIT
+        val finalQuiet = effective["q"]?.toIntOrNull() ?: quiet
+        val finalCorrelate = effective.containsKey("i") || effective.containsKey("I")
+        return finishLoad(effective, complete, finalAction, finalQuiet, chainId, finalCorrelate)
     }
 
     private fun finishLoad(

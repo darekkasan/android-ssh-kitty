@@ -766,20 +766,20 @@ fun TerminalScreen(
                     } else {
                         val common = newValue.commonPrefixWith(old).length
                         val added = newValue.substring(common)
+                        // The sentinel must never reach the terminal: IMEs
+                        // rarely move it mid-text, so strip strays here.
+                        fun clean(s: String) =
+                            s.replace("\uFEFF", "").replace("\r\n", "\r").replace('\n', '\r')
                         if (common == 0) {
                             // Total replacement (IME rewrote the field):
                             // old content was already sent when typed, so
                             // send only the new text, no phantom backspaces.
-                            viewModel.sendInput(
-                                added.replace("\r\n", "\r").replace('\n', '\r')
-                            )
+                            val text = clean(added)
+                            if (text.isNotEmpty()) viewModel.sendInput(text)
                         } else {
                             repeat(old.length - common) { viewModel.sendInput("\b") }
-                            if (added.isNotEmpty()) {
-                                viewModel.sendInput(
-                                    added.replace("\r\n", "\r").replace('\n', '\r')
-                                )
-                            }
+                            val text = clean(added)
+                            if (text.isNotEmpty()) viewModel.sendInput(text)
                         }
                         inputText = if (newValue.length > 512) INPUT_SENTINEL else newValue
                     }
