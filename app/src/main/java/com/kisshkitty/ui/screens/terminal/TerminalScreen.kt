@@ -24,8 +24,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -511,11 +511,10 @@ fun TerminalScreen(
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
     var scrollAcc by remember { mutableFloatStateOf(0f) }
-    // Explicit select mode: the visible field only becomes focusable
-    // here, so typing focus is never stolen and selection handles
-    // (which require focus) always work inside the mode.
-    var selectMode by remember { mutableStateOf(false) }
-    val visibleFocus = remember { FocusRequester() }
+    // Whether the visible (read-only) field currently holds focus.
+    // Selection handles require focus, so the field stays focusable and
+    // long-press selection works like any normal app.
+    var visibleHasFocus by remember { mutableStateOf(false) }
 
     val density = LocalDensity.current
     // Monospace cell metrics. The terminal grid is derived from the font,
@@ -578,21 +577,19 @@ fun TerminalScreen(
     // Fresh read for gesture guards without relaunch churn.
     val fieldRef = rememberUpdatedState(fieldValue)
 
-    fun exitSelectMode() {
-        selectMode = false
-        fieldValue = fieldValue.copy(selection = TextRange.Zero)
-        focusRequester.requestFocus()
-        keyboardController?.show()
-    }
-
-    // Focus the visible field once it is focusable in select mode.
-    // (Read-only never opens the keyboard.)
-    LaunchedEffect(selectMode) {
-        if (selectMode) {
-            kotlinx.coroutines.delay(150)
-            try {
-                visibleFocus.requestFocus()
-            } catch (_: Exception) {}
+    // A tap briefly parks focus on the visible field. If no selection
+    // started (i.e. it really was a tap), hand focus back to the input
+    // field so typing continues. A real long-press selection is already
+    // non-collapsed by then and keeps focus.
+    LaunchedEffect(visibleHasFocus) {
+        if (visibleHasFocus) {
+            kotlinx.coroutines.delay(700)
+            if (fieldRef.value.selection.collapsed) {
+                try {
+                    focusRequester.requestFocus()
+                    keyboardController?.show()
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -671,9 +668,7 @@ fun TerminalScreen(
                     .pointerInput(Unit) {
                         detectTapGestures(
                             onTap = {
-                                if (selectMode) {
-                                    exitSelectMode()
-                                } else if (!fieldRef.value.selection.collapsed) {
+                                if (!fieldRef.value.selection.collapsed) {
                                     fieldValue = fieldValue.copy(selection = TextRange.Zero)
                                 } else {
                                     focusRequester.requestFocus()
@@ -683,12 +678,12 @@ fun TerminalScreen(
                         )
                     }
                     .pointerInput(Unit) {
-                        // Plain drag scrolls. Inside select mode (or with an
-                        // active selection) the drag belongs to selection.
+                        // Plain drag scrolls. With an active selection the
+                        // drag belongs to selection extension.
                         detectDragGestures(
                             onDragStart = { scrollAcc = 0f },
                             onDrag = { _, amount ->
-                                if (!selectMode && fieldRef.value.selection.collapsed) {
+                                if (fieldRef.value.selection.collapsed) {
                                     scrollAcc += amount.y
                                     val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
                                     if (lines != 0) {
@@ -700,16 +695,15 @@ fun TerminalScreen(
                         )
                     }
             ) {
-                // Visible text with standard Android selection. Read-only:
-                // input keeps flowing through the hidden field, so this one
-                // never takes focus or opens the keyboard.
+                // Visible text with standard Android selection. Read-only
+                // so it never opens the keyboard; typing stays on the
+                // hidden field.
                 BasicTextField(
                     value = fieldValue,
                     onValueChange = { fieldValue = it },
                     modifier = Modifier
                         .fillMaxSize()
-                        .focusRequester(visibleFocus)
-                        .focusProperties { canFocus = selectMode },
+                        .onFocusChanged { visibleHasFocus = it.isFocused },
                     readOnly = true,
                     enabled = true,
                     textStyle = TextStyle(
@@ -834,14 +828,20 @@ fun TerminalScreen(
                                 clipboard.setText(AnnotatedString(text))
                                 Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                             }
-                            exitSelectMode()
+                            fieldValue = fieldValue.copy(selection = TextRange.Zero)
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
                         }) {
                             Icon(Icons.Default.ContentCopy, contentDescription = null)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Copy")
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        OutlinedButton(onClick = { exitSelectMode() }) {
+                        OutlinedButton(onClick = {
+                            fieldValue = fieldValue.copy(selection = TextRange.Zero)
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
+                        }) {
                             Text("Cancel")
                         }
                     }
@@ -896,19 +896,6 @@ fun TerminalScreen(
                             onClick = { viewModel.setViewportOffset(0) }
                         ) {
                             Text("↓")
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-                    // Explicit select mode: standard handles + toolbar,
-                    // focusable only here so typing is never disturbed.
-                    if (selectMode) {
-                        Button(onClick = { exitSelectMode() }) {
-                            Text("Done")
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                    } else {
-                        OutlinedButton(onClick = { selectMode = true }) {
-                            Text("Select")
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                     }
