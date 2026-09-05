@@ -624,7 +624,9 @@ fun TerminalScreen(
                                         val move = event.changes.firstOrNull { it.id == down.id }
                                             ?: break
                                         if (!move.pressed) break
-                                        scrollAcc += -move.positionChange().y
+                                        // Content follows the finger: drag down
+                                        // reveals older lines above.
+                                        scrollAcc += move.positionChange().y
                                         val lines = (scrollAcc / cellMetrics.lineHeight).toInt()
                                         if (lines != 0) {
                                             scrollAcc -= lines * cellMetrics.lineHeight
