@@ -562,8 +562,6 @@ fun TerminalScreen(
         }
         fieldValue = TextFieldValue(annotated, sel)
     }
-        fieldValue = TextFieldValue(annotated, sel)
-    }
     // Fresh read for gesture guards without relaunch churn.
     val fieldRef = rememberUpdatedState(fieldValue)
 
