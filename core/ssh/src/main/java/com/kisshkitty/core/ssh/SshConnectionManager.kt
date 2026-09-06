@@ -100,18 +100,14 @@ class SshConnectionManager @Inject constructor() {
     fun readFromTerminal(): ByteArray? {
         return try {
             val input = inputStream ?: return null
-            val available = input.available()
-            if (available <= 0) return null
-            // Read in full: InputStream.read() may return short.
-            val size = available.coerceAtMost(MAX_READ_BYTES)
-            val buffer = ByteArray(size)
-            var total = 0
-            while (total < size) {
-                val r = input.read(buffer, total, size - total)
-                if (r <= 0) break
-                total += r
-            }
-            if (total <= 0) null else buffer.copyOf(total)
+            if (input.available() <= 0) return null
+            // Exactly one read: it returns what is there right now.
+            // Waiting for more inside the poll loop can block forever
+            // (killing all output incl. typed echo); leftovers are
+            // picked up on the next poll 16ms later.
+            val buffer = ByteArray(MAX_READ_BYTES)
+            val n = input.read(buffer, 0, MAX_READ_BYTES)
+            if (n <= 0) null else buffer.copyOf(n)
         } catch (e: Exception) {
             null
         }
