@@ -610,8 +610,6 @@ fun TerminalScreen(
             }
         }
     }
-        }
-    }
 
     // Report metrics for image cell resolution, then fit the grid.
     LaunchedEffect(cellMetrics) {
