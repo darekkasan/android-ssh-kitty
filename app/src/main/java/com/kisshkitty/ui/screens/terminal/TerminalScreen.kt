@@ -32,6 +32,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.onSizeChanged
@@ -446,6 +449,9 @@ private val TERMINAL_FONT_SIZE = 14.sp
 // U+FEFF is invisible and is never sent: diffs only send the suffix.
 private const val INPUT_SENTINEL = "\uFEFF"
 
+// Delete is sent as DEL (0x7F, the standard VERASE character).
+private const val DELETE_CHAR = "\u007F"
+
 private data class CellMetrics(
     val textSizePx: Float,
     val charWidth: Float,
@@ -530,6 +536,12 @@ fun TerminalScreen(
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     var inputText by remember { mutableStateOf(INPUT_SENTINEL) }
+    var lastKeyDeleteAt by remember { mutableLongStateOf(0L) }
+
+    // True if a key-event delete was just handled: the text change that
+    // some keyboards send alongside it must not double-send.
+    fun justDeletedViaKey(): Boolean =
+        android.os.SystemClock.uptimeMillis() - lastKeyDeleteAt < 400
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
     var scrollAcc by remember { mutableFloatStateOf(0f) }
@@ -797,6 +809,9 @@ fun TerminalScreen(
             // BringIntoView on requestFocus() and crashes the app.
             // The field always holds INPUT_SENTINEL so the Backspace key
             // always deletes something (an empty field fires no event).
+            // Delete is sent as DEL (0x7F, the standard VERASE character,
+            // same as Termux and our special-key path), never BS (0x08)
+            // which canonical-mode line disciplines ignore.
             BasicTextField(
                 value = inputText,
                 onValueChange = { newValue ->
@@ -808,7 +823,9 @@ fun TerminalScreen(
                     if (newValue.isEmpty()) {
                         // Sentinel itself deleted: real Backspace, then
                         // restore it so the key keeps working.
-                        if (old.isNotEmpty()) viewModel.sendInput("\b")
+                        if (old.isNotEmpty() && !justDeletedViaKey()) {
+                            viewModel.sendInput(DELETE_CHAR)
+                        }
                         inputText = INPUT_SENTINEL
                     } else {
                         val common = newValue.commonPrefixWith(old).length
@@ -824,7 +841,9 @@ fun TerminalScreen(
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         } else {
-                            repeat(old.length - common) { viewModel.sendInput("\b") }
+                            if (!justDeletedViaKey()) {
+                                repeat(old.length - common) { viewModel.sendInput(DELETE_CHAR) }
+                            }
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         }
@@ -835,7 +854,18 @@ fun TerminalScreen(
                     .focusRequester(focusRequester)
                     .size(1.dp)
                     .alpha(0.01f)
-                    .onPlaced { isTextFieldPlaced = true },
+                    .onPlaced { isTextFieldPlaced = true }
+                    .onKeyEvent { event ->
+                        // Hardware keyboards and some IMEs deliver delete
+                        // as a key event instead of a text change.
+                        if (event.type == KeyEventType.KeyDown && event.key == Key.Backspace) {
+                            lastKeyDeleteAt = android.os.SystemClock.uptimeMillis()
+                            viewModel.sendInput(DELETE_CHAR)
+                            true
+                        } else {
+                            false
+                        }
+                    },
                 // Password mode: no suggestions / autocorrect on the terminal.
                 // Enter is an IME action so it fires reliably every time
                 // instead of depending on text commits. Multi-line: a 1dp
