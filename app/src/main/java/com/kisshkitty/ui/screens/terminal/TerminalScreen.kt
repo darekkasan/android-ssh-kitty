@@ -593,21 +593,21 @@ fun TerminalScreen(
     // Fresh read for gesture guards without relaunch churn.
     val fieldRef = rememberUpdatedState(fieldValue)
 
-    // A tap briefly parks focus on the visible field. Hand focus back
-    // to the input field when the press ENDS (lift) with no selection:
-    // judging at lift (not on a timer, not on touch-down) never steals
-    // a long-press selection being born.
-    var wasPressed by remember { mutableStateOf(false) }
-    LaunchedEffect(visiblePressed) {
-        if (wasPressed && !visiblePressed) {
-            if (visibleHasFocus && fieldRef.value.selection.collapsed) {
+    // A tap briefly parks focus on the visible field. Shortly after,
+    // hand focus back to the input field if the user is NOT pressing
+    // anymore and no selection started: this restores typing without
+    // ever stealing a long-press selection being born (a held press
+    // always skips the bounce, whenever it lifts).
+    LaunchedEffect(visibleHasFocus) {
+        if (visibleHasFocus) {
+            kotlinx.coroutines.delay(250)
+            if (!visiblePressed && fieldRef.value.selection.collapsed) {
                 try {
                     focusRequester.requestFocus()
                     keyboardController?.show()
                 } catch (_: Exception) {}
             }
         }
-        wasPressed = visiblePressed
     }
 
     // The visible field takes focus on touch-down (needed for selection
