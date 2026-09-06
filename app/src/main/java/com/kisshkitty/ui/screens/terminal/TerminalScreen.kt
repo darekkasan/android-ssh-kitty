@@ -33,6 +33,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
@@ -855,7 +856,7 @@ fun TerminalScreen(
                     .size(1.dp)
                     .alpha(0.01f)
                     .onPlaced { isTextFieldPlaced = true }
-                    .onKeyEvent { event ->
+                    .onKeyEvent { event: KeyEvent ->
                         // Hardware keyboards and some IMEs deliver delete
                         // as a key event instead of a text change.
                         if (event.type == KeyEventType.KeyDown && event.key == Key.Backspace) {
