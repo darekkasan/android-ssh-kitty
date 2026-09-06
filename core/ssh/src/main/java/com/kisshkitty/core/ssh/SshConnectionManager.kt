@@ -182,4 +182,4 @@ data class SshConnection(
     val shell: Session.Shell
 )
 
-private const val MAX_READ_BYTES = 65536
+private const val MAX_READ_BYTES = 262144

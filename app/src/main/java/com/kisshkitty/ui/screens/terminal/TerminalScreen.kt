@@ -103,6 +103,10 @@ class TerminalViewModel @Inject constructor(
     // Cell metrics (px) reported by the UI for image cell resolution.
     private var cellW = 10f
     private var cellH = 20f
+    // All terminal/kitty state lives on this single thread: parsing and
+    // bitmap decoding stay off the UI thread, and the emulator is never
+    // touched concurrently. Only StateFlows cross threads (safe).
+    private val parseDispatcher = Dispatchers.Default.limitedParallelism(1)
 
     fun connect(hostId: String) {
         viewModelScope.launch {
@@ -143,8 +147,13 @@ class TerminalViewModel @Inject constructor(
                         sshConnectionManager.readFromTerminal()
                     }
                     if (data != null) {
-                        val text = String(data)
-                        processTerminalOutput(text)
+                        val text = String(data, Charsets.UTF_8)
+                        withContext(parseDispatcher) {
+                            processTerminalOutput(text)
+                        }
+                    } else {
+                        // Idle: back off. Busy: drain immediately.
+                        delay(16)
                     }
                 } catch (e: CancellationException) {
                     throw e
@@ -152,7 +161,6 @@ class TerminalViewModel @Inject constructor(
                     // Never let one bad chunk silently kill the loop.
                     e.printStackTrace()
                 }
-                delay(16)
             }
             _terminalState.value = TerminalState.Disconnected
         }
@@ -316,6 +324,7 @@ class TerminalViewModel @Inject constructor(
         }
     }
 
+    // Must run on parseDispatcher (touches emulator + viewportOffset).
     private fun refreshViewport() {
         val total = terminalEmulator.getScrollbackSize() + terminalEmulator.getRows()
         val maxOff = (total - terminalEmulator.getRows()).coerceAtLeast(0)
@@ -324,12 +333,21 @@ class TerminalViewModel @Inject constructor(
     }
 
     fun setViewportOffset(offset: Int) {
-        viewportOffset = offset
-        refreshViewport()
+        viewModelScope.launch(parseDispatcher) {
+            setViewportOffsetSync(offset)
+        }
     }
 
     fun addViewportOffset(deltaLines: Int) {
-        if (deltaLines != 0) setViewportOffset(viewportOffset + deltaLines)
+        if (deltaLines == 0) return
+        viewModelScope.launch(parseDispatcher) {
+            setViewportOffsetSync(viewportOffset + deltaLines)
+        }
+    }
+
+    private fun setViewportOffsetSync(offset: Int) {
+        viewportOffset = offset
+        refreshViewport()
     }
 
     fun setCellMetrics(charWidthPx: Float, lineHeightPx: Float) {
@@ -337,6 +355,7 @@ class TerminalViewModel @Inject constructor(
         cellH = lineHeightPx
     }
 
+    // Benign racy read (paste-time hint only).
     fun isBracketedPaste(): Boolean = terminalEmulator.bracketedPaste
 
     fun sendInput(text: String) {
@@ -394,28 +413,31 @@ class TerminalViewModel @Inject constructor(
     }
 
     fun resizeIfNeeded(cols: Int, rows: Int, widthPx: Int = 0, heightPx: Int = 0) {
-        if (cols != terminalEmulator.getCols() || rows != terminalEmulator.getRows()) {
-            val oldRows = terminalEmulator.getRows()
-            val sbBefore = terminalEmulator.getScrollbackSize()
-            terminalEmulator.resize(cols, rows)
-            // Collapse keyboard-animation resize storms into one trailing
-            // window-change; it shares the write mutex with channel data.
-            resizeNotifyJob?.cancel()
-            resizeNotifyJob = viewModelScope.launch {
-                kotlinx.coroutines.delay(300)
-                sshConnectionManager.resizeTerminal(cols, rows, widthPx, heightPx)
-            }
-            // Growth pads blanks on top (after pulling scrollback back):
-            // shift grid-anchored images down so they stay glued.
-            val sbAfter = terminalEmulator.getScrollbackSize()
-            val blankPad = (terminalEmulator.getRows() - oldRows).coerceAtLeast(0) -
-                (sbBefore - sbAfter).coerceAtLeast(0)
-            if (blankPad > 0) {
-                _placedImages.value = _placedImages.value.map {
-                    if (it.absLine >= sbAfter) it.copy(absLine = it.absLine + blankPad) else it
+        // Collapse layout storms into one trailing server notice.
+        resizeNotifyJob?.cancel()
+        resizeNotifyJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(300)
+            sshConnectionManager.resizeTerminal(cols, rows, widthPx, heightPx)
+        }
+        // Grid work runs on the parse thread (single-threaded with all
+        // other emulator access).
+        viewModelScope.launch(parseDispatcher) {
+            if (cols != terminalEmulator.getCols() || rows != terminalEmulator.getRows()) {
+                val oldRows = terminalEmulator.getRows()
+                val sbBefore = terminalEmulator.getScrollbackSize()
+                terminalEmulator.resize(cols, rows)
+                // Growth pads blanks on top (after pulling scrollback back):
+                // shift grid-anchored images down so they stay glued.
+                val sbAfter = terminalEmulator.getScrollbackSize()
+                val blankPad = (terminalEmulator.getRows() - oldRows).coerceAtLeast(0) -
+                    (sbBefore - sbAfter).coerceAtLeast(0)
+                if (blankPad > 0) {
+                    _placedImages.value = _placedImages.value.map {
+                        if (it.absLine >= sbAfter) it.copy(absLine = it.absLine + blankPad) else it
+                    }
                 }
+                refreshViewport()
             }
-            refreshViewport()
         }
     }
 
