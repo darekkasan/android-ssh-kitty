@@ -9,6 +9,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -527,6 +529,8 @@ fun TerminalScreen(
     // Selection handles require focus, so the field stays focusable and
     // long-press selection works like any normal app.
     var visibleHasFocus by remember { mutableStateOf(false) }
+    val visibleInteraction = remember { MutableInteractionSource() }
+    val visiblePressed by visibleInteraction.collectIsPressedAsState()
 
     val density = LocalDensity.current
     // Monospace cell metrics. The terminal grid is derived from the font,
@@ -592,16 +596,20 @@ fun TerminalScreen(
     // A tap briefly parks focus on the visible field. If no selection
     // started (i.e. it really was a tap), hand focus back to the input
     // field so typing continues. A real long-press selection is already
-    // non-collapsed by then and keeps focus.
+    // non-collapsed by then and keeps focus. The press check matters:
+    // at 700ms a held long-press may still show collapsed selection,
+    // and stealing focus then would kill the selection being born.
     LaunchedEffect(visibleHasFocus) {
         if (visibleHasFocus) {
             kotlinx.coroutines.delay(700)
-            if (fieldRef.value.selection.collapsed) {
+            if (!visiblePressed && fieldRef.value.selection.collapsed) {
                 try {
                     focusRequester.requestFocus()
                     keyboardController?.show()
                 } catch (_: Exception) {}
             }
+        }
+    }
         }
     }
 
@@ -718,6 +726,7 @@ fun TerminalScreen(
                         .onFocusChanged { visibleHasFocus = it.isFocused },
                     readOnly = true,
                     enabled = true,
+                    interactionSource = visibleInteraction,
                     textStyle = TextStyle(
                         fontFamily = FontFamily.Monospace,
                         fontSize = TERMINAL_FONT_SIZE,
