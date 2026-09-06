@@ -391,12 +391,12 @@ class TerminalViewModel @Inject constructor(
         }
     }
 
-    fun resizeIfNeeded(cols: Int, rows: Int) {
+    fun resizeIfNeeded(cols: Int, rows: Int, widthPx: Int = 0, heightPx: Int = 0) {
         if (cols != terminalEmulator.getCols() || rows != terminalEmulator.getRows()) {
             val oldRows = terminalEmulator.getRows()
             val sbBefore = terminalEmulator.getScrollbackSize()
             terminalEmulator.resize(cols, rows)
-            sshConnectionManager.resizeTerminal(cols, rows)
+            sshConnectionManager.resizeTerminal(cols, rows, widthPx, heightPx)
             // Growth pads blanks on top (after pulling scrollback back):
             // shift grid-anchored images down so they stay glued.
             val sbAfter = terminalEmulator.getScrollbackSize()
@@ -593,22 +593,21 @@ fun TerminalScreen(
     // Fresh read for gesture guards without relaunch churn.
     val fieldRef = rememberUpdatedState(fieldValue)
 
-    // A tap briefly parks focus on the visible field. If no selection
-    // started (i.e. it really was a tap), hand focus back to the input
-    // field so typing continues. A real long-press selection is already
-    // non-collapsed by then and keeps focus. The press check matters:
-    // at 700ms a held long-press may still show collapsed selection,
-    // and stealing focus then would kill the selection being born.
-    LaunchedEffect(visibleHasFocus) {
-        if (visibleHasFocus) {
-            kotlinx.coroutines.delay(700)
-            if (!visiblePressed && fieldRef.value.selection.collapsed) {
+    // A tap briefly parks focus on the visible field. Hand focus back
+    // to the input field when the press ENDS (lift) with no selection:
+    // judging at lift (not on a timer, not on touch-down) never steals
+    // a long-press selection being born.
+    var wasPressed by remember { mutableStateOf(false) }
+    LaunchedEffect(visiblePressed) {
+        if (wasPressed && !visiblePressed) {
+            if (visibleHasFocus && fieldRef.value.selection.collapsed) {
                 try {
                     focusRequester.requestFocus()
                     keyboardController?.show()
                 } catch (_: Exception) {}
             }
         }
+        wasPressed = visiblePressed
     }
 
     // Report metrics for image cell resolution, then fit the grid.
@@ -676,12 +675,13 @@ fun TerminalScreen(
                     .fillMaxSize()
                     .onSizeChanged { px ->
                         // Fit the grid to the screen: no stretched rows,
-                        // no overlapping glyphs.
+                        // no overlapping glyphs. Pixel size goes to the
+                        // server too (window-change) for correct layout.
                         val cols = (px.width / cellMetrics.charWidth).toInt()
                             .coerceIn(20, 256)
                         val rows = (px.height / cellMetrics.lineHeight).toInt()
                             .coerceIn(8, 200)
-                        viewModel.resizeIfNeeded(cols, rows)
+                        viewModel.resizeIfNeeded(cols, rows, px.width, px.height)
                     }
                     .pointerInput(Unit) {
                         detectTapGestures(

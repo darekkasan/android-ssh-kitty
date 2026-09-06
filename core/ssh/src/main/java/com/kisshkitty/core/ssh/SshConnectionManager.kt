@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.SecurityUtils
+import net.schmizz.sshj.connection.channel.direct.PTYMode
 import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.transport.verification.PromiscuousVerifier
 import java.io.InputStream
@@ -67,9 +68,11 @@ class SshConnectionManager @Inject constructor() {
                 else -> throw IllegalStateException("Either password or keyPath must be provided")
             }
 
-            // Open interactive shell session with PTY
+            // Open interactive shell with a real terminal type so remote
+            // apps (vim, chafa, colors) detect capabilities properly.
+            // True window size follows via resizeTerminal().
             val session = client.startSession()
-            session.allocateDefaultPTY()
+            session.allocatePTY("xterm-256color", 80, 24, 0, 0, mapOf(PTYMode.ECHO to 1))
             val shell = session.startShell()
 
             currentClient = client
@@ -114,8 +117,15 @@ class SshConnectionManager @Inject constructor() {
         }
     }
 
-    fun resizeTerminal(cols: Int, rows: Int) {
-        // PTY resize not supported in current implementation
+    fun resizeTerminal(cols: Int, rows: Int, widthPx: Int = 0, heightPx: Int = 0) {
+        // Best effort: tell the server the real window size (SIGWINCH,
+        // TIOCGWINSZ) so full-screen apps and image tools lay out
+        // correctly. The channel may be closing; never crash on it.
+        try {
+            currentShell?.changeWindowDimensions(cols, rows, widthPx, heightPx)
+        } catch (e: Exception) {
+            Log.e("SshConnectionManager", "Window change failed", e)
+        }
     }
 
     fun disconnect() {
