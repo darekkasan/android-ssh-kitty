@@ -2,6 +2,8 @@ package com.kisshkitty.core.ssh
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.SecurityUtils
@@ -88,12 +90,22 @@ class SshConnectionManager @Inject constructor() {
         }
     }
 
-    fun writeToTerminal(data: ByteArray) {
-        try {
-            outputStream?.write(data)
-            outputStream?.flush()
-        } catch (e: Exception) {
-            Log.e("SshConnectionManager", "Write failed", e)
+    // All channel writes go through one mutex. sshj channels are not
+    // safe for concurrent writers: interleaved keystroke coroutines
+    // corrupt the packet stream and sshd kills the connection
+    // ("Bad packet length" / "Connection corrupted" server-side).
+    private val writeMutex = Mutex()
+
+    suspend fun writeToTerminal(data: ByteArray) {
+        writeMutex.withLock {
+            withContext(Dispatchers.IO) {
+                try {
+                    outputStream?.write(data)
+                    outputStream?.flush()
+                } catch (e: Exception) {
+                    Log.e("SshConnectionManager", "Write failed", e)
+                }
+            }
         }
     }
 
