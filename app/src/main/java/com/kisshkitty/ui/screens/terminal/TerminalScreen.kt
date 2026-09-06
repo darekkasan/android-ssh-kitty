@@ -610,6 +610,15 @@ fun TerminalScreen(
         wasPressed = visiblePressed
     }
 
+    // The visible field takes focus on touch-down (needed for selection
+    // handles). Keep the keyboard open anyway: selecting must not close
+    // it. Keystrokes that land here are forwarded to the shell below.
+    LaunchedEffect(visibleHasFocus) {
+        if (visibleHasFocus) {
+            keyboardController?.show()
+        }
+    }
+
     // Report metrics for image cell resolution, then fit the grid.
     LaunchedEffect(cellMetrics) {
         viewModel.setCellMetrics(cellMetrics.charWidth, cellMetrics.lineHeight)
@@ -714,11 +723,28 @@ fun TerminalScreen(
                     }
             ) {
                 // Visible text with standard Android selection. Read-only
-                // so it never opens the keyboard; typing stays on the
-                // hidden field.
+                // so it never opens the keyboard by itself; typing stays
+                // on the hidden field, with stray commits forwarded below.
                 BasicTextField(
                     value = fieldValue,
-                    onValueChange = { fieldValue = it },
+                    onValueChange = { newValue ->
+                        val cur = fieldValue
+                        if (newValue.text != cur.annotatedString.text) {
+                            // Typed while the display field is focused
+                            // (keyboard stays open during selection):
+                            // forward it to the shell, hand focus back.
+                            val common = newValue.text.commonPrefixWith(cur.annotatedString.text).length
+                            val added = newValue.text.substring(common)
+                            if (added.isNotEmpty()) {
+                                viewModel.sendInput(
+                                    added.replace("\r\n", "\r").replace('\n', '\r')
+                                )
+                            }
+                            focusRequester.requestFocus()
+                        } else {
+                            fieldValue = newValue
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxSize()
                         .onFocusChanged { visibleHasFocus = it.isFocused },
