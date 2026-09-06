@@ -94,6 +94,7 @@ class SshConnectionManager @Inject constructor() {
     // safe for concurrent writers: interleaved keystroke coroutines
     // corrupt the packet stream and sshd kills the connection
     // ("Bad packet length" / "Connection corrupted" server-side).
+    // Window changes share the same transport, so they take it too.
     private val writeMutex = Mutex()
 
     suspend fun writeToTerminal(data: ByteArray) {
@@ -125,14 +126,20 @@ class SshConnectionManager @Inject constructor() {
         }
     }
 
-    fun resizeTerminal(cols: Int, rows: Int, widthPx: Int = 0, heightPx: Int = 0) {
+    suspend fun resizeTerminal(cols: Int, rows: Int, widthPx: Int = 0, heightPx: Int = 0) {
         // Best effort: tell the server the real window size (SIGWINCH,
         // TIOCGWINSZ) so full-screen apps and image tools lay out
-        // correctly. The channel may be closing; never crash on it.
-        try {
-            currentShell?.changeWindowDimensions(cols, rows, widthPx, heightPx)
-        } catch (e: Exception) {
-            Log.e("SshConnectionManager", "Window change failed", e)
+        // correctly. Serialized with channel writes: concurrent transport
+        // writes corrupt the stream and get the connection killed.
+        // The channel may be closing; never crash on it.
+        writeMutex.withLock {
+            withContext(Dispatchers.IO) {
+                try {
+                    currentShell?.changeWindowDimensions(cols, rows, widthPx, heightPx)
+                } catch (e: Exception) {
+                    Log.e("SshConnectionManager", "Window change failed", e)
+                }
+            }
         }
     }
 

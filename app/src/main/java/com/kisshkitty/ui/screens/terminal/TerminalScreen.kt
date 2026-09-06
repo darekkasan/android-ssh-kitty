@@ -88,6 +88,7 @@ class TerminalViewModel @Inject constructor(
     private val terminalEmulator = TerminalEmulator()
     private val kittyRenderer = KittyImageRenderer()
     private var readingJob: kotlinx.coroutines.Job? = null
+    private var resizeNotifyJob: kotlinx.coroutines.Job? = null
 
     private val _viewport = MutableStateFlow(terminalEmulator.getWindow(0))
     val viewport: StateFlow<TerminalEmulator.EmulatorWindow> = _viewport
@@ -367,6 +368,7 @@ class TerminalViewModel @Inject constructor(
 
     fun disconnect() {
         readingJob?.cancel()
+        resizeNotifyJob?.cancel()
         stopForegroundService()
         sshConnectionManager.disconnect()
         _terminalState.value = TerminalState.Disconnected
@@ -396,7 +398,13 @@ class TerminalViewModel @Inject constructor(
             val oldRows = terminalEmulator.getRows()
             val sbBefore = terminalEmulator.getScrollbackSize()
             terminalEmulator.resize(cols, rows)
-            sshConnectionManager.resizeTerminal(cols, rows, widthPx, heightPx)
+            // Collapse keyboard-animation resize storms into one trailing
+            // window-change; it shares the write mutex with channel data.
+            resizeNotifyJob?.cancel()
+            resizeNotifyJob = viewModelScope.launch {
+                kotlinx.coroutines.delay(300)
+                sshConnectionManager.resizeTerminal(cols, rows, widthPx, heightPx)
+            }
             // Growth pads blanks on top (after pulling scrollback back):
             // shift grid-anchored images down so they stay glued.
             val sbAfter = terminalEmulator.getScrollbackSize()
