@@ -32,10 +32,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEvent
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.onSizeChanged
@@ -537,12 +533,6 @@ fun TerminalScreen(
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
     var inputText by remember { mutableStateOf(INPUT_SENTINEL) }
-    var lastKeyDeleteAt by remember { mutableLongStateOf(0L) }
-
-    // True if a key-event delete was just handled: the text change that
-    // some keyboards send alongside it must not double-send.
-    fun justDeletedViaKey(): Boolean =
-        android.os.SystemClock.uptimeMillis() - lastKeyDeleteAt < 400
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
     var scrollAcc by remember { mutableFloatStateOf(0f) }
@@ -824,7 +814,7 @@ fun TerminalScreen(
                     if (newValue.isEmpty()) {
                         // Sentinel itself deleted: real Backspace, then
                         // restore it so the key keeps working.
-                        if (old.isNotEmpty() && !justDeletedViaKey()) {
+                        if (old.isNotEmpty()) {
                             viewModel.sendInput(DELETE_CHAR)
                         }
                         inputText = INPUT_SENTINEL
@@ -842,9 +832,7 @@ fun TerminalScreen(
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         } else {
-                            if (!justDeletedViaKey()) {
-                                repeat(old.length - common) { viewModel.sendInput(DELETE_CHAR) }
-                            }
+                            repeat(old.length - common) { viewModel.sendInput(DELETE_CHAR) }
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         }
@@ -855,18 +843,7 @@ fun TerminalScreen(
                     .focusRequester(focusRequester)
                     .size(1.dp)
                     .alpha(0.01f)
-                    .onPlaced { isTextFieldPlaced = true }
-                    .onKeyEvent { event: KeyEvent ->
-                        // Hardware keyboards and some IMEs deliver delete
-                        // as a key event instead of a text change.
-                        if (event.type == KeyEventType.KeyDown && event.key == Key.Backspace) {
-                            lastKeyDeleteAt = android.os.SystemClock.uptimeMillis()
-                            viewModel.sendInput(DELETE_CHAR)
-                            true
-                        } else {
-                            false
-                        }
-                    },
+                    .onPlaced { isTextFieldPlaced = true },
                 // Password mode: no suggestions / autocorrect on the terminal.
                 // Enter is an IME action so it fires reliably every time
                 // instead of depending on text commits. Multi-line: a 1dp
