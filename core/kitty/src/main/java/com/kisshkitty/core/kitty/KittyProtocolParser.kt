@@ -54,6 +54,40 @@ class KittyProtocolParser {
         const val MAX_PENDING_BYTES = 64 * 1024 * 1024
         /** Cap on stored images (placed refs keep their bitmaps anyway). */
         const val MAX_STORED_IMAGES = 64
+        /** Cap on stored image pixels (bitmaps live in placed refs anyway). */
+        const val MAX_STORED_BYTES = 96 * 1024 * 1024
+    }
+
+    /**
+     * Scratch pixel buffers. Reused across frames (same object never
+     * escapes: setPixels copies out), so video doesn't churn the GC.
+     */
+    private object ScratchPool {
+        private const val MAX_ARRAYS = 4
+        private const val MAX_BYTES = 64 * 1024 * 1024
+        private val pool = ArrayDeque<IntArray>()
+
+        @Synchronized
+        fun obtain(size: Int): IntArray {
+            val it = pool.iterator()
+            while (it.hasNext()) {
+                val a = it.next()
+                if (a.size == size) {
+                    it.remove()
+                    return a
+                }
+            }
+            return IntArray(size)
+        }
+
+        @Synchronized
+        fun release(a: IntArray) {
+            var bytes = 0
+            for (e in pool) bytes += e.size * 4
+            if (pool.size < MAX_ARRAYS && bytes + a.size * 4 <= MAX_BYTES) {
+                pool.addLast(a)
+            }
+        }
     }
 
     /** Placement of an image, resolved without pixel metrics. */
@@ -340,7 +374,9 @@ class KittyProtocolParser {
         )
         if (imageId != 0) {
             images[imageId] = image
-            while (images.size > MAX_STORED_IMAGES) {
+            // Evict oldest first, by count and by bytes (video frames are
+            // big; placed refs keep their own bitmaps alive anyway).
+            while (images.size > MAX_STORED_IMAGES || storedBytes() > MAX_STORED_BYTES) {
                 val eldest = images.keys.firstOrNull() ?: break
                 if (eldest == imageId) break
                 images.remove(eldest)
@@ -457,6 +493,14 @@ class KittyProtocolParser {
 
     fun newestIdForNumber(number: Int): Int? = numbers[number]?.lastOrNull()
 
+    private fun storedBytes(): Long {
+        var total = 0L
+        for (image in images.values) {
+            total += image.bitmap.width.toLong() * image.bitmap.height.toLong() * 4L
+        }
+        return total
+    }
+
     fun freeUnreferenced(keepIds: Set<Int>) {
         val it = images.keys.iterator()
         while (it.hasNext()) {
@@ -497,7 +541,7 @@ class KittyProtocolParser {
         if (data.size < width * height * 3) return null
 
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val pixels = IntArray(width * height)
+        val pixels = ScratchPool.obtain(width * height)
 
         for (i in 0 until width * height) {
             val offset = i * 3
@@ -508,6 +552,7 @@ class KittyProtocolParser {
         }
 
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+        ScratchPool.release(pixels)
         return bitmap
     }
 
@@ -516,7 +561,7 @@ class KittyProtocolParser {
         if (data.size < width * height * 4) return null
 
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val pixels = IntArray(width * height)
+        val pixels = ScratchPool.obtain(width * height)
 
         for (i in 0 until width * height) {
             val offset = i * 4
@@ -528,6 +573,7 @@ class KittyProtocolParser {
         }
 
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
+        ScratchPool.release(pixels)
         return bitmap
     }
 

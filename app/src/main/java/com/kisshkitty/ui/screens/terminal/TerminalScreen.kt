@@ -355,8 +355,10 @@ class TerminalViewModel @Inject constructor(
         cellH = lineHeightPx
     }
 
-    // Benign racy read (paste-time hint only).
     fun isBracketedPaste(): Boolean = terminalEmulator.bracketedPaste
+
+    // Benign racy read (called from composition for change detection).
+    fun textVersion(): Long = terminalEmulator.textVersion
 
     fun sendInput(text: String) {
         viewModelScope.launch(Dispatchers.IO) {
@@ -493,7 +495,9 @@ data class PlacedImage(
 
 private const val MAX_PLACED_IMAGES = 24
 
-/** Viewport grid as styled text (standard selection, cursor as inverse). */
+/** Viewport grid as styled text (standard selection). The cursor is a
+ * cheap canvas rect (see TerminalCanvas), never part of the text, so
+ * cursor motion alone never triggers a text relayout. */
 private fun buildTerminalAnnotated(
     w: TerminalEmulator.EmulatorWindow
 ): AnnotatedString {
@@ -504,30 +508,12 @@ private fun buildTerminalAnnotated(
             val bgRow = w.bg.getOrNull(y)
             var x = 0
             while (x < row.size) {
-                val isCursor = x == w.cursorX && y == w.cursorY
-                val fg = if (isCursor) {
-                    android.graphics.Color.BLACK
-                } else {
-                    fgRow?.getOrNull(x) ?: android.graphics.Color.WHITE
-                }
-                val bg = if (isCursor) {
-                    android.graphics.Color.WHITE
-                } else {
-                    bgRow?.getOrNull(x) ?: android.graphics.Color.BLACK
-                }
+                val fg = fgRow?.getOrNull(x) ?: android.graphics.Color.WHITE
+                val bg = bgRow?.getOrNull(x) ?: android.graphics.Color.BLACK
                 var x2 = x + 1
                 while (x2 < row.size) {
-                    val c2 = x2 == w.cursorX && y == w.cursorY
-                    val f2 = if (c2) {
-                        android.graphics.Color.BLACK
-                    } else {
-                        fgRow?.getOrNull(x2) ?: android.graphics.Color.WHITE
-                    }
-                    val b2 = if (c2) {
-                        android.graphics.Color.WHITE
-                    } else {
-                        bgRow?.getOrNull(x2) ?: android.graphics.Color.BLACK
-                    }
+                    val f2 = fgRow?.getOrNull(x2) ?: android.graphics.Color.WHITE
+                    val b2 = bgRow?.getOrNull(x2) ?: android.graphics.Color.BLACK
                     if (f2 != fg || b2 != bg) break
                     x2++
                 }
@@ -585,16 +571,18 @@ fun TerminalScreen(
     val terminalLineHeightSp = with(density) { cellMetrics.lineHeight.toSp() }
 
     // Visible text (standard Android selection) + its selection state.
-    // Rebuilt whenever the viewport changes. When the window scrolled,
-    // the highlight shifts with it so it stays glued to the same text
-    // instead of being wiped (wiping made selection impossible while
-    // output was streaming).
+    // The annotated text is rebuilt only when the content actually
+    // changed (emulator version bump); image-only frames skip the
+    // expensive text relayout entirely. Selection bookkeeping still
+    // runs every time so the highlight stays glued across scrolls.
     var fieldValue by remember { mutableStateOf(TextFieldValue(AnnotatedString(""))) }
     var lastWindowStart by remember { mutableStateOf<Int?>(null) }
     var lastCols by remember { mutableStateOf<Int?>(null) }
+    var builtVersion by remember { mutableStateOf(-1L) }
     LaunchedEffect(viewport) {
-        val annotated = buildTerminalAnnotated(viewport)
         val cols = if (viewport.chars.isNotEmpty()) viewport.chars[0].size else 0
+        val rows = viewport.chars.size
+        val textLen = if (rows == 0 || cols == 0) 0 else rows * cols + (rows - 1)
         val prevStart = lastWindowStart
         val prevCols = lastCols
         lastWindowStart = viewport.windowStart
@@ -604,11 +592,11 @@ fun TerminalScreen(
         ) {
             val stride = cols + 1
             val d = viewport.windowStart - prevStart
-            val rows = (viewport.chars.size - 1).coerceAtLeast(0)
+            val maxRow = (rows - 1).coerceAtLeast(0)
             fun shift(off: Int): Int {
-                val y = (off / stride - d).coerceIn(0, rows)
+                val y = (off / stride - d).coerceIn(0, maxRow)
                 val x = (off % stride).coerceIn(0, cols)
-                return (y * stride + x).coerceIn(0, annotated.length)
+                return (y * stride + x).coerceIn(0, textLen)
             }
             val s = fieldValue.selection
             TextRange(shift(s.start), shift(s.end))
@@ -617,11 +605,16 @@ fun TerminalScreen(
         } else {
             val s = fieldValue.selection
             TextRange(
-                s.start.coerceIn(0, annotated.length),
-                s.end.coerceIn(0, annotated.length)
+                s.start.coerceIn(0, textLen),
+                s.end.coerceIn(0, textLen)
             )
         }
-        fieldValue = TextFieldValue(annotated, sel)
+        if (viewModel.textVersion() != builtVersion) {
+            builtVersion = viewModel.textVersion()
+            fieldValue = TextFieldValue(buildTerminalAnnotated(viewport), sel)
+        } else if (fieldValue.selection != sel) {
+            fieldValue = fieldValue.copy(selection = sel)
+        }
     }
     // Fresh read for gesture guards without relaunch churn.
     val fieldRef = rememberUpdatedState(fieldValue)
@@ -796,6 +789,7 @@ fun TerminalScreen(
                 TerminalCanvas(
                     placedImages = placedImages,
                     windowStartLine = viewport.windowStart,
+                    cursorPosition = viewport.cursorX to viewport.cursorY,
                     cellWidth = cellMetrics.charWidth,
                     cellHeight = cellMetrics.lineHeight,
                     modifier = Modifier.fillMaxSize()
@@ -1037,12 +1031,14 @@ fun TerminalScreen(
 fun TerminalCanvas(
     placedImages: List<PlacedImage>,
     windowStartLine: Int,
+    cursorPosition: Pair<Int, Int>,
     cellWidth: Float,
     cellHeight: Float,
     modifier: Modifier = Modifier
 ) {
     // Transparent overlay: text (with standard selection) is drawn by the
-    // read-only field below; only Kitty images live here.
+    // read-only field below; images and the block cursor live here so
+    // they never force a text relayout.
     Canvas(modifier = modifier) {
         fun drawPlaced(p: PlacedImage) {
             val bw = p.bitmap.width
@@ -1069,6 +1065,19 @@ fun TerminalCanvas(
         // Images with non-negative z-index go over the text.
         for (p in placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))) {
             if (p.zIndex >= 0) drawPlaced(p)
+        }
+
+        // Block cursor. -1 hides it (scrolled away or cursor hidden).
+        // A rect, not a text span, so cursor motion is nearly free.
+        val cursorX = cursorPosition.first.coerceAtLeast(0)
+        val cursorY = cursorPosition.second
+        if (cursorY >= 0) {
+            drawRect(
+                color = Color.White,
+                topLeft = Offset(cursorX * cellWidth, cursorY * cellHeight),
+                size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight),
+                alpha = 0.5f
+            )
         }
     }
 }

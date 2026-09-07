@@ -38,6 +38,10 @@ class TerminalEmulator(
     private var bgColors = Array(rows) { IntArray(cols) { Color.BLACK } }
     private var attributes = Array(rows) { IntArray(cols) { 0 } }
 
+    /** Bumped on every text-content mutation (not cursor moves). */
+    var textVersion = 0L
+        private set
+
     private val scrollback = ArrayDeque<ScrollLine>()
 
     private var cursorX = 0
@@ -177,6 +181,7 @@ class TerminalEmulator(
             fgColors[cursorY][cursorX] = currentFg
             bgColors[cursorY][cursorX] = currentBg
             attributes[cursorY][cursorX] = currentAttributes
+            textVersion++
         }
         cursorX++
     }
@@ -216,6 +221,7 @@ class TerminalEmulator(
             bgColors[rows - 1] = IntArray(cols) { currentBg }
             attributes[rows - 1] = IntArray(cols) { 0 }
         }
+        textVersion++
     }
 
     /** Scroll lines [top, bottom] up by one without touching scrollback. */
@@ -233,6 +239,7 @@ class TerminalEmulator(
         fgColors[bottom] = IntArray(cols) { currentFg }
         bgColors[bottom] = IntArray(cols) { currentBg }
         attributes[bottom] = IntArray(cols) { 0 }
+        textVersion++
     }
 
     /** Scroll lines [top, bottom] down by [n] (insert blank lines at top). */
@@ -253,6 +260,7 @@ class TerminalEmulator(
             bgColors[y] = IntArray(cols) { currentBg }
             attributes[y] = IntArray(cols) { 0 }
         }
+        textVersion++
     }
 
     /**
@@ -382,6 +390,7 @@ class TerminalEmulator(
 
         when (finalChar) {
             '@' -> {
+                textVersion++
                 // Insert blank characters
                 val count = p(0, 1).coerceAtLeast(1)
                 val row = cursorY
@@ -440,6 +449,7 @@ class TerminalEmulator(
                 cursorX = (p(1, 1) - 1).coerceIn(0, (cols - 1).coerceAtLeast(0))
             }
             'J' -> {
+                textVersion++
                 // Erase in Display
                 when (p(0, 0)) {
                     0 -> {
@@ -480,6 +490,7 @@ class TerminalEmulator(
                 }
             }
             'K' -> {
+                textVersion++
                 // Erase in Line
                 if (cursorY !in buffer.indices) return
                 when (p(0, 0)) {
@@ -505,6 +516,7 @@ class TerminalEmulator(
                 }
             }
             'L' -> {
+                textVersion++
                 // Insert lines
                 val count = p(0, 1).coerceAtLeast(1)
                 val top = cursorY.coerceIn(regionTop, regionBottom)
@@ -523,6 +535,7 @@ class TerminalEmulator(
                 }
             }
             'M' -> {
+                textVersion++
                 // Delete lines
                 val count = p(0, 1).coerceAtLeast(1)
                 val top = cursorY.coerceIn(regionTop, regionBottom)
@@ -541,6 +554,7 @@ class TerminalEmulator(
                 }
             }
             'P' -> {
+                textVersion++
                 // Delete characters
                 val count = p(0, 1).coerceAtLeast(1)
                 val row = cursorY
@@ -573,6 +587,7 @@ class TerminalEmulator(
                 scrollRegionDown(p(0, 1).coerceAtLeast(1))
             }
             'X' -> {
+                textVersion++
                 // Erase characters (overwrite with space)
                 val count = p(0, 1).coerceAtLeast(1)
                 val row = cursorY
@@ -730,6 +745,7 @@ class TerminalEmulator(
     }
 
     fun clear() {
+        textVersion++
         for (y in 0 until rows) {
             if (y < buffer.size) {
                 buffer[y] = CharArray(cols) { ' ' }
@@ -744,6 +760,7 @@ class TerminalEmulator(
 
     fun resize(newCols: Int, newRows: Int) {
         if (newCols == cols && newRows == rows) return
+        textVersion++
         // Shrinking rows must not kill lines: the top rows that no
         // longer fit move into the scrollback (chronological order kept,
         // cursor stays on the newest content). Growing pulls recently
