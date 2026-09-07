@@ -540,7 +540,8 @@ class KittyProtocolParser {
         if (width <= 0 || height <= 0) return null
         if (data.size < width * height * 3) return null
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmap = BitmapPool.obtain(width, height)
+            ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val pixels = ScratchPool.obtain(width * height)
 
         for (i in 0 until width * height) {
@@ -560,7 +561,8 @@ class KittyProtocolParser {
         if (width <= 0 || height <= 0) return null
         if (data.size < width * height * 4) return null
 
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmap = BitmapPool.obtain(width, height)
+            ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val pixels = ScratchPool.obtain(width * height)
 
         for (i in 0 until width * height) {

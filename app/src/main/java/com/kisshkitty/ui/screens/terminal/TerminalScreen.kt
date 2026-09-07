@@ -55,6 +55,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.kisshkitty.core.kitty.BitmapPool
 import com.kisshkitty.core.kitty.KittyImage
 import com.kisshkitty.core.kitty.KittyImageRenderer
 import com.kisshkitty.core.kitty.KittyProtocolParser
@@ -246,7 +247,29 @@ class TerminalViewModel @Inject constructor(
             yOffPx = op.yOffPx,
             zIndex = op.zIndex
         )
-        _placedImages.value = (_placedImages.value + placed).takeLast(MAX_PLACED_IMAGES)
+        // Same-id placements replace each other (video frames): no
+        // ghost trail, no unbounded bitmap pile. Displaced bitmaps go
+        // back to the pool only when the store moved on as well.
+        val parser = kittyRenderer.getParser()
+        val previous = _placedImages.value
+        val displaced = if (image.id != 0) {
+            previous.filter { it.imageId == image.id }
+        } else {
+            emptyList()
+        }
+        val next = (previous - displaced.toSet() + placed).takeLast(MAX_PLACED_IMAGES)
+        val dropped = previous.filter { old -> next.none { it === old } }
+        val released = mutableSetOf<android.graphics.Bitmap>()
+        for (dead in displaced + dropped) {
+            val bmp = dead.bitmap
+            if (bmp in released) continue
+            val stored = parser.getImage(dead.imageId)?.bitmap
+            if (stored == null || stored !== bmp) {
+                BitmapPool.release(bmp)
+                released.add(bmp)
+            }
+        }
+        _placedImages.value = next
         if (!op.noCursorMove) {
             terminalEmulator.advanceForImage(placeCols, placeRows)
         }
@@ -304,7 +327,8 @@ class TerminalViewModel @Inject constructor(
                 y1 in (p.absLine + 1)..(p.absLine + p.rCells)
         }
 
-        val kept = _placedImages.value.filterNot { p ->
+        val previous = _placedImages.value
+        val kept = previous.filterNot { p ->
             when (sel.kind) {
                 'a' -> true
                 'i' -> p.imageId == sel.imageId
@@ -319,6 +343,18 @@ class TerminalViewModel @Inject constructor(
             }
         }
         _placedImages.value = kept
+        // Recycle bitmaps nobody references anymore (same ownership rule
+        // as placing: stored ones stay, the rest go back to the pool).
+        val released = mutableSetOf<android.graphics.Bitmap>()
+        for (dead in previous.filter { old -> kept.none { it === old } }) {
+            val bmp = dead.bitmap
+            if (bmp in released) continue
+            val stored = parser.getImage(dead.imageId)?.bitmap
+            if (stored == null || stored !== bmp) {
+                BitmapPool.release(bmp)
+                released.add(bmp)
+            }
+        }
         if (sel.freeData) {
             parser.freeUnreferenced(kept.map { it.imageId }.toSet())
         }
