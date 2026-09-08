@@ -370,7 +370,10 @@ class KittyProtocolParser {
             bitmap = bitmap,
             width = bitmap.width,
             height = bitmap.height,
-            format = format
+            format = format,
+            // Raw-copied RGBA holds wire order; the GPU swaps R<->B
+            // at draw time (see the canvas color matrix).
+            swapRB = format == FORMAT_RGBA
         )
         if (imageId != 0) {
             images[imageId] = image
@@ -559,23 +562,16 @@ class KittyProtocolParser {
 
     private fun createRgbaBitmap(data: ByteArray, width: Int, height: Int): Bitmap? {
         if (width <= 0 || height <= 0) return null
-        if (data.size < width * height * 4) return null
+        val need = width * height * 4
+        if (data.size < need) return null
 
+        // No Kotlin swizzle loop: bulk-copy the wire bytes (memcpy speed)
+        // and let the GPU swap R<->B at draw time via color matrix.
+        // The copy is raw, so mark unpremultiplied to keep alpha exact.
         val bitmap = BitmapPool.obtain(width, height)
             ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val pixels = ScratchPool.obtain(width * height)
-
-        for (i in 0 until width * height) {
-            val offset = i * 4
-            val r = data[offset].toInt() and 0xFF
-            val g = data[offset + 1].toInt() and 0xFF
-            val b = data[offset + 2].toInt() and 0xFF
-            val a = data[offset + 3].toInt() and 0xFF
-            pixels[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
-        }
-
-        bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
-        ScratchPool.release(pixels)
+        bitmap.setPremultiplied(false)
+        bitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(data, 0, need))
         return bitmap
     }
 
@@ -623,7 +619,9 @@ data class KittyImage(
     val width: Int,
     val height: Int,
     val format: Int,
-    val placement: KittyPlacement? = null
+    val placement: KittyPlacement? = null,
+    /** Raw wire-order pixels: swap R<->B on the GPU when drawing. */
+    val swapRB: Boolean = false
 )
 
 data class KittyPlacement(

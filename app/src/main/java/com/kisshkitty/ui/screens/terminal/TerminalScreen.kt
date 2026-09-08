@@ -231,7 +231,7 @@ class TerminalViewModel @Inject constructor(
         val anchorCol = terminalEmulator.getCursorX()
         val anchorLine = terminalEmulator.getScrollbackSize() + terminalEmulator.getCursorY()
         val bitmap = try {
-            cropBitmap(image.bitmap, op)
+            cropBitmap(image.bitmap, op, image.swapRB)
         } catch (e: Exception) {
             null
         } ?: return
@@ -245,7 +245,8 @@ class TerminalViewModel @Inject constructor(
             rCells = placeRows,
             xOffPx = op.xOffPx,
             yOffPx = op.yOffPx,
-            zIndex = op.zIndex
+            zIndex = op.zIndex,
+            swapRB = image.swapRB
         )
         // Same-id placements replace each other (video frames): no
         // ghost trail, no unbounded bitmap pile. Displaced bitmaps go
@@ -277,7 +278,8 @@ class TerminalViewModel @Inject constructor(
 
     private fun cropBitmap(
         src: android.graphics.Bitmap,
-        op: KittyProtocolParser.ShowOp
+        op: KittyProtocolParser.ShowOp,
+        swapRB: Boolean
     ): android.graphics.Bitmap {
         if (op.srcW <= 0 || op.srcH <= 0) return src
         val x = op.srcX.coerceIn(0, (src.width - 1).coerceAtLeast(0))
@@ -285,7 +287,11 @@ class TerminalViewModel @Inject constructor(
         val w = op.srcW.coerceIn(1, src.width - x)
         val h = op.srcH.coerceIn(1, src.height - y)
         if (w <= 0 || h <= 0) return src
-        return android.graphics.Bitmap.createBitmap(src, x, y, w, h)
+        return android.graphics.Bitmap.createBitmap(src, x, y, w, h).also {
+            // Keep the pixel-layout contract of the source: raw-copied
+            // (unpremultiplied) stays unpremultiplied.
+            it.setPremultiplied(swapRB.not())
+        }
     }
 
     /** Resolve placement cells (spec: missing c/r derives from aspect). */
@@ -517,8 +523,7 @@ private data class CellMetrics(
 )
 
 /** An image anchored to an absolute terminal line. */
-data class PlacedImage(
-    val imageId: Int,
+data class PlacedImage(    val imageId: Int,
     val bitmap: android.graphics.Bitmap,
     val col: Int,
     val absLine: Int,
@@ -526,10 +531,27 @@ data class PlacedImage(
     val rCells: Int,
     val xOffPx: Int,
     val yOffPx: Int,
-    val zIndex: Int
+    val zIndex: Int,
+    val swapRB: Boolean
 )
 
 private const val MAX_PLACED_IMAGES = 24
+
+/**
+ * Swaps red and blue channels on the GPU. Raw-copied RGBA bitmaps hold
+ * wire order (R,G,B,A in little-endian ARGB_8888 slots); drawing them
+ * through this matrix yields correct colors with zero CPU swizzling.
+ */
+private val RB_SWAP_FILTER = androidx.compose.ui.graphics.ColorFilter.colorMatrix(
+    androidx.compose.ui.graphics.ColorMatrix(
+        floatArrayOf(
+            0f, 0f, 1f, 0f, 0f,
+            0f, 1f, 0f, 0f, 0f,
+            1f, 0f, 0f, 0f, 0f,
+            0f, 0f, 0f, 1f, 0f
+        )
+    )
+)
 
 /** Viewport grid as styled text (standard selection). The cursor is a
  * cheap canvas rect (see TerminalCanvas), never part of the text, so
@@ -1089,7 +1111,8 @@ fun TerminalCanvas(
                     (p.col * cellWidth + p.xOffPx).toInt(),
                     (viewRow * cellHeight + p.yOffPx).toInt()
                 ),
-                dstSize = IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1))
+                dstSize = IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1)),
+                colorFilter = if (p.swapRB) RB_SWAP_FILTER else null
             )
         }
 
