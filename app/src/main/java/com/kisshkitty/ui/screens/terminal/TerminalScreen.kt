@@ -576,7 +576,9 @@ private fun buildTerminalAnnotated(
                     x2++
                 }
                 withStyle(SpanStyle(color = Color(fg), background = Color(bg))) {
-                    append(row.concatToString(x, x2))
+                    // Wide-char continuation cells render as space (they
+                    // belong to the previous cell's glyph).
+                    append(row.concatToString(x, x2).replace(TerminalEmulator.WIDE_CONT, ' '))
                 }
                 x = x2
             }

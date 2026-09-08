@@ -167,6 +167,10 @@ class TerminalEmulator(
     }
 
     private fun putChar(char: Char) {
+        val w = charWidth(char)
+        // Combining marks have no cell of their own; drop them rather
+        // than breaking column alignment.
+        if (w == 0) return
         if (cursorX >= cols) {
             if (autoWrap) {
                 cursorX = 0
@@ -175,15 +179,67 @@ class TerminalEmulator(
                 cursorX = cols - 1
             }
         }
+        // Never split a wide char across the margin.
+        if (w == 2 && cursorX + 1 >= cols) {
+            if (autoWrap) {
+                cursorX = 0
+                lineFeed()
+            } else {
+                cursorX = (cols - 2).coerceAtLeast(0)
+            }
+        }
         // Regular character (guard with real array bounds)
         if (cursorY in buffer.indices && cursorX in buffer[cursorY].indices) {
+            val old = buffer[cursorY][cursorX]
             buffer[cursorY][cursorX] = char
             fgColors[cursorY][cursorX] = currentFg
             bgColors[cursorY][cursorX] = currentBg
             attributes[cursorY][cursorX] = currentAttributes
+            if (w == 2 && cursorX + 1 < cols && cursorX + 1 < buffer[cursorY].size) {
+                buffer[cursorY][cursorX + 1] = WIDE_CONT
+                fgColors[cursorY][cursorX + 1] = currentFg
+                bgColors[cursorY][cursorX + 1] = currentBg
+                attributes[cursorY][cursorX + 1] = currentAttributes
+            }
+            // Overwriting a wide char with a narrow one orphans its
+            // continuation cell: clear it.
+            if (w == 1 && old != ' ' && charWidth(old) == 2 &&
+                cursorX + 1 < cols && cursorX + 1 < buffer[cursorY].size &&
+                buffer[cursorY][cursorX + 1] == WIDE_CONT
+            ) {
+                buffer[cursorY][cursorX + 1] = ' '
+                fgColors[cursorY][cursorX + 1] = currentFg
+                bgColors[cursorY][cursorX + 1] = currentBg
+                attributes[cursorY][cursorX + 1] = 0
+            }
             textVersion++
         }
-        cursorX++
+        cursorX += w
+    }
+
+    /**
+     * Terminal cell width of a character: 0 for combining marks, 2 for
+     * East Asian Wide/Fullwidth (CJK etc.), 1 otherwise.
+     */
+    private fun charWidth(c: Char): Int {
+        val type = Character.getType(c).toInt()
+        if (type == Character.NON_SPACING_MARK.toInt() ||
+            type == Character.ENCLOSING_MARK.toInt() ||
+            type == Character.COMBINING_SPACING_MARK.toInt()
+        ) {
+            return 0
+        }
+        val ea = android.icu.lang.UCharacter.getIntPropertyValue(
+            c.code,
+            android.icu.lang.UProperty.EAST_ASIAN_WIDTH
+        )
+        return if (ea == android.icu.lang.UCharacter.EastAsianWidth.WIDE ||
+            ea == android.icu.lang.UCharacter.EastAsianWidth.FULLWIDTH
+        ) {
+            2
+        } else {
+            1
+        }
     }
 
     private fun lineFeed() {
@@ -889,6 +945,10 @@ class TerminalEmulator(
 
     companion object {
         const val MAX_SCROLLBACK = 500
+        /** Second-half cell of a double-width (CJK) character. Never
+         * arrives from the stream (C0 controls are ignored), so it is
+         * safe as an internal marker. Renders as a space. */
+        const val WIDE_CONT = '\u0000'
         const val ATTR_BOLD = 1
         const val ATTR_DIM = 2
         const val ATTR_ITALIC = 4
