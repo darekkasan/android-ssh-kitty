@@ -51,6 +51,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
@@ -60,6 +61,7 @@ import com.kisshkitty.core.kitty.KittyImage
 import com.kisshkitty.core.kitty.KittyImageRenderer
 import com.kisshkitty.core.kitty.KittyProtocolParser
 import com.kisshkitty.core.terminal.TerminalEmulator
+import com.kisshkitty.core.terminal.cellWidthOf
 import com.kisshkitty.core.ssh.SshConfig
 import com.kisshkitty.core.ssh.SshConnectionManager
 import com.kisshkitty.data.HostRepository
@@ -518,8 +520,13 @@ private val RB_SWAP_FILTER = androidx.compose.ui.graphics.ColorFilter.colorMatri
 /** Viewport grid as styled text (standard selection). The cursor is a
  * cheap canvas rect (see TerminalCanvas), never part of the text, so
  * cursor motion alone never triggers a text relayout. */
+/** Wide (CJK) pairs get measured letter-spacing so each pair is
+ * exactly two cells wide however the fallback font metrics look:
+ * no gaps, and rows never overflow into a wrap (which is what
+ * shifted everything vertically). */
 private fun buildTerminalAnnotated(
-    w: TerminalEmulator.EmulatorWindow
+    w: TerminalEmulator.EmulatorWindow,
+    wideSpacing: TextUnit = 0.sp
 ): AnnotatedString {
     return buildAnnotatedString {
         for (y in w.chars.indices) {
@@ -528,10 +535,33 @@ private fun buildTerminalAnnotated(
             val bgRow = w.bg.getOrNull(y)
             var x = 0
             while (x < row.size) {
+                if (x + 1 < row.size && cellWidthOf(row[x]) == 2 &&
+                    row[x + 1] == TerminalEmulator.WIDE_CONT
+                ) {
+                    val fg = fgRow?.getOrNull(x) ?: android.graphics.Color.WHITE
+                    val bg = bgRow?.getOrNull(x) ?: android.graphics.Color.BLACK
+                    withStyle(
+                        SpanStyle(
+                            color = Color(fg),
+                            background = Color(bg),
+                            letterSpacing = wideSpacing
+                        )
+                    ) {
+                        append(row[x])
+                        append(' ')
+                    }
+                    x += 2
+                    continue
+                }
                 val fg = fgRow?.getOrNull(x) ?: android.graphics.Color.WHITE
                 val bg = bgRow?.getOrNull(x) ?: android.graphics.Color.BLACK
                 var x2 = x + 1
                 while (x2 < row.size) {
+                    if (x2 + 1 < row.size && cellWidthOf(row[x2]) == 2 &&
+                        row[x2 + 1] == TerminalEmulator.WIDE_CONT
+                    ) {
+                        break
+                    }
                     val f2 = fgRow?.getOrNull(x2) ?: android.graphics.Color.WHITE
                     val b2 = bgRow?.getOrNull(x2) ?: android.graphics.Color.BLACK
                     if (f2 != fg || b2 != bg) break
@@ -591,6 +621,21 @@ fun TerminalScreen(
         )
     }
     val terminalLineHeightSp = with(density) { cellMetrics.lineHeight.toSp() }
+    // Per-pair correction so a wide glyph + its cell is exactly two
+    // columns on this device's fallback font (trailing spacing is
+    // included in line width; the epsilon keeps rounding from wrapping).
+    // Self-adapting: proper 2x fonts compress the marker, narrow
+    // fallbacks stretch the pair.
+    val wideSpacingSp: TextUnit = with(density) {
+        val measure = android.graphics.Paint().apply {
+            typeface = Typeface.MONOSPACE
+            textSize = with(density) { TERMINAL_FONT_SIZE.toPx() }
+        }
+        val wideAdvance = measure.measureText("あ")
+        val spaceAdvance = measure.measureText(" ")
+        ((2 * cellMetrics.charWidth - wideAdvance - spaceAdvance - 0.5f) / 2)
+            .coerceIn(-cellMetrics.charWidth, cellMetrics.charWidth).toSp()
+    }
 
     // Visible text (standard Android selection) + its selection state.
     // The annotated text is rebuilt only when the content actually
@@ -633,7 +678,7 @@ fun TerminalScreen(
         }
         if (viewModel.textVersion() != builtVersion) {
             builtVersion = viewModel.textVersion()
-            fieldValue = TextFieldValue(buildTerminalAnnotated(viewport), sel)
+            fieldValue = TextFieldValue(buildTerminalAnnotated(viewport, wideSpacingSp), sel)
         } else if (fieldValue.selection != sel) {
             fieldValue = fieldValue.copy(selection = sel)
         }

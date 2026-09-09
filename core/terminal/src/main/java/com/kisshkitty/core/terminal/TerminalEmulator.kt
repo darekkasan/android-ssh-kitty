@@ -220,27 +220,9 @@ class TerminalEmulator(
     /**
      * Terminal cell width of a character: 0 for combining marks, 2 for
      * East Asian Wide/Fullwidth (CJK etc.), 1 otherwise.
+     * Shared with the UI layer so rendering matches the grid.
      */
-    private fun charWidth(c: Char): Int {
-        val type = Character.getType(c).toInt()
-        if (type == Character.NON_SPACING_MARK.toInt() ||
-            type == Character.ENCLOSING_MARK.toInt() ||
-            type == Character.COMBINING_SPACING_MARK.toInt()
-        ) {
-            return 0
-        }
-        val ea = android.icu.lang.UCharacter.getIntPropertyValue(
-            c.code,
-            android.icu.lang.UProperty.EAST_ASIAN_WIDTH
-        )
-        return if (ea == android.icu.lang.UCharacter.EastAsianWidth.WIDE ||
-            ea == android.icu.lang.UCharacter.EastAsianWidth.FULLWIDTH
-        ) {
-            2
-        } else {
-            1
-        }
-    }
+    private fun charWidth(c: Char): Int = cellWidthOf(c)
 
     private fun lineFeed() {
         val limit = if (isRegionActive()) regionBottom else rows - 1
@@ -959,4 +941,31 @@ class TerminalEmulator(
     }
 
     data class ParseResult(val newIndex: Int)
+}
+
+
+/**
+ * Terminal cell width of a character, shared with the UI layer so
+ * rendering matches the grid: 0 for combining marks, 2 for East
+ * Asian Wide/Fullwidth (CJK etc.), 1 otherwise.
+ */
+fun cellWidthOf(c: Char): Int {
+    val type = Character.getType(c).toInt()
+    if (type == Character.NON_SPACING_MARK.toInt() ||
+        type == Character.ENCLOSING_MARK.toInt() ||
+        type == Character.COMBINING_SPACING_MARK.toInt()
+    ) {
+        return 0
+    }
+    val ea = android.icu.lang.UCharacter.getIntPropertyValue(
+        c.code,
+        android.icu.lang.UProperty.EAST_ASIAN_WIDTH
+    )
+    return if (ea == android.icu.lang.UCharacter.EastAsianWidth.WIDE ||
+        ea == android.icu.lang.UCharacter.EastAsianWidth.FULLWIDTH
+    ) {
+        2
+    } else {
+        1
+    }
 }
