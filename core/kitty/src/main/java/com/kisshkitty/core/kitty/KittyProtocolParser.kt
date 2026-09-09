@@ -132,7 +132,24 @@ class KittyProtocolParser {
     private data class PendingUpload(
         var params: Map<String, String>,
         val data: ByteArrayOutputStream = ByteArrayOutputStream()
-    )
+    ) {
+        companion object {
+            /** Pre-sized accumulator when the total is known up front. */
+            fun withExpected(params: Map<String, String>): PendingUpload {
+                return PendingUpload(params, ByteArrayOutputStream(expectedBytes(params)))
+            }
+
+            private fun expectedBytes(params: Map<String, String>): Int {
+                // PNG size is unknowable up front (compressed): grow naturally.
+                if ((params["f"]?.toIntOrNull() ?: FORMAT_RGBA) == FORMAT_PNG) return 32
+                val w = params["s"]?.toIntOrNull() ?: 0
+                val h = params["v"]?.toIntOrNull() ?: 0
+                if (w <= 0 || h <= 0) return 32
+                val bpp = if ((params["f"]?.toIntOrNull() ?: FORMAT_RGBA) == FORMAT_RGB) 3 else 4
+                return (w.toLong() * h.toLong() * bpp).coerceAtMost(256L * 1024L * 1024L).toInt()
+            }
+        }
+    }
 
     private val images = mutableMapOf<Int, KittyImage>()
     /** Image number -> image ids in creation order (newest last). */
@@ -277,14 +294,19 @@ class KittyProtocolParser {
         pending.remove(cid)
         if (cid == lastChainId) lastChainId = null
         val first = state.params
-        val complete = ByteArrayOutputStream().also { out ->
-            state.data.writeTo(out)
-            try {
-                out.write(Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT))
-            } catch (e: Exception) {
-                return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
-            }
-        }.toByteArray()
+        val finalData = try {
+            Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT)
+        } catch (e: Exception) {
+            return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
+        }
+        val complete = if (state.data.size() > 0) {
+            ByteArrayOutputStream(state.data.size() + finalData.size).also { out ->
+                state.data.writeTo(out)
+                out.write(finalData)
+            }.toByteArray()
+        } else {
+            finalData
+        }
         val finalAction = first["a"] ?: ACTION_TRANSMIT
         val finalQuiet = first["q"]?.toIntOrNull() ?: q
         val finalCorrelate = first.containsKey("i") || first.containsKey("I")
@@ -369,7 +391,7 @@ class KittyProtocolParser {
         }
 
         if (more == 1) {
-            val state = pending.getOrPut(chainId) { PendingUpload(chainParams) }
+            val state = pending.getOrPut(chainId) { PendingUpload.withExpected(chainParams) }
             state.data.write(data)
             if (state.data.size() > MAX_PENDING_BYTES) {
                 pending.remove(chainId)
@@ -395,10 +417,16 @@ class KittyProtocolParser {
             }
         }
         val effective = if (first != null) first.params else chainParams
-        val complete = ByteArrayOutputStream().also { out ->
-            first?.data?.writeTo(out)
-            out.write(data)
-        }.toByteArray()
+        // Single-chunk uploads use the decoded bytes directly instead
+        // of copying them through a fresh accumulator.
+        val complete = if (first != null && first.data.size() > 0) {
+            ByteArrayOutputStream(first.data.size() + data.size).also { out ->
+                first.data.writeTo(out)
+                out.write(data)
+            }.toByteArray()
+        } else {
+            data
+        }
 
         // Action/quiet/correlation come from the effective (first-chunk)
         // params: the final chunk usually carries only m=0, which must
@@ -669,7 +697,20 @@ class KittyProtocolParser {
 
     private fun createPngBitmap(data: ByteArray): Bitmap? {
         if (data.isEmpty()) return null
-        return BitmapFactory.decodeByteArray(data, 0, data.size)
+        // Prefer GPU-resident bitmaps: zero app-heap pixels and no
+        // upload on draw. Falls back for oversized/odd PNGs.
+        return try {
+            val opts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.HARDWARE
+            }
+            BitmapFactory.decodeByteArray(data, 0, data.size, opts)
+        } catch (e: Exception) {
+            null
+        } ?: try {
+            BitmapFactory.decodeByteArray(data, 0, data.size)
+        } catch (e: Exception) {
+            null
+        }
     }
 }
 

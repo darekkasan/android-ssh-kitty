@@ -31,6 +31,9 @@ object BitmapPool {
 
     @Synchronized
     fun release(bitmap: Bitmap) {
+        // Only mutable bitmaps can be reused as decode targets.
+        // HARDWARE (GPU-resident, immutable) bitmaps are never pooled.
+        if (bitmap.config == Bitmap.Config.HARDWARE || !bitmap.isMutable) return
         var bytes = 0L
         for (b in pool) bytes += b.width.toLong() * b.height.toLong() * 4L
         val size = bitmap.width.toLong() * bitmap.height.toLong() * 4L
