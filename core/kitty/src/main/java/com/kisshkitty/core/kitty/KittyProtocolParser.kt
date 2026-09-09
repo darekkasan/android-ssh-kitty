@@ -159,14 +159,26 @@ class KittyProtocolParser {
         // and puts/deletes usually have no payload either.
         val separatorIndex = content.indexOf(';')
         val controlData: String
-        val payload: String
+        val payload: ByteArray
         if (separatorIndex == -1) {
             controlData = content
-            payload = ""
+            payload = ByteArray(0)
         } else {
             controlData = content.substring(0, separatorIndex)
-            payload = content.substring(separatorIndex + 1)
+            // Base64 payloads are pure ASCII.
+            payload = content.substring(separatorIndex + 1).toByteArray(Charsets.US_ASCII)
         }
+        return parseControl(controlData, payload, 0, payload.size)
+    }
+
+    /**
+     * Parse one complete APC with a byte-slice payload (zero-copy hot
+     * path: no payload String is ever materialized).
+     *
+     * @param controlData raw control data including the leading 'G'
+     * @param payload raw payload bytes
+     */
+    fun parseControl(controlData: String, payload: ByteArray, payloadOff: Int, payloadLen: Int): List<KittyEvent> {
 
         // The APC command code: every graphics sequence is ESC _ G ...,
         // so the control data starts with a lone 'G'. Strip it, otherwise
@@ -179,7 +191,7 @@ class KittyProtocolParser {
         if (body == "m=1" || body == "m=0" ||
             body.startsWith("m=1,q=") || body.startsWith("m=0,q=")
         ) {
-            return handleMarker(body, payload)
+            return handleMarker(body, payload, payloadOff, payloadLen)
         }
 
         val params = parseControlData(body)
@@ -208,7 +220,7 @@ class KittyProtocolParser {
 
         return when (action) {
             ACTION_TRANSMIT, ACTION_TRANSMIT_AND_DISPLAY,
-            ACTION_QUERY, ACTION_FRAME -> handleLoad(params, payload, action, quiet)
+            ACTION_QUERY, ACTION_FRAME -> handleLoad(params, payload, payloadOff, payloadLen, action, quiet)
             ACTION_PUT -> handlePut(params, quiet)
             ACTION_DELETE -> handleDelete(params)
             // Animation control / compose: parsed, intentionally ignored.
@@ -225,7 +237,12 @@ class KittyProtocolParser {
      * Bare continuation/final marker: "m=0", "m=1", "m=0,q=N" or
      * "m=1,q=N". No map building on this hot path.
      */
-    private fun handleMarker(control: String, payload: String): List<KittyEvent> {
+    private fun handleMarker(
+        control: String,
+        payload: ByteArray,
+        payloadOff: Int,
+        payloadLen: Int
+    ): List<KittyEvent> {
         val m: Int
         val q: Int
         when {
@@ -245,7 +262,7 @@ class KittyProtocolParser {
         val state = cid?.let { pending[it] } ?: return emptyList()
         if (m == 1) {
             val data = try {
-                Base64.decode(payload, Base64.DEFAULT)
+                Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT)
             } catch (e: Exception) {
                 return abortChain(cid, state, "EINVAL: bad base64 payload")
             }
@@ -263,7 +280,7 @@ class KittyProtocolParser {
         val complete = ByteArrayOutputStream().also { out ->
             state.data.writeTo(out)
             try {
-                out.write(Base64.decode(payload, Base64.DEFAULT))
+                out.write(Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT))
             } catch (e: Exception) {
                 return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
             }
@@ -291,7 +308,9 @@ class KittyProtocolParser {
 
     private fun handleLoad(
         params: Map<String, String>,
-        payload: String,
+        payload: ByteArray,
+        payloadOff: Int,
+        payloadLen: Int,
         action: String,
         quiet: Int
     ): List<KittyEvent> {
@@ -339,7 +358,7 @@ class KittyProtocolParser {
 
         val more = params["m"]?.toIntOrNull() ?: 0
         val data = try {
-            Base64.decode(payload, Base64.DEFAULT)
+            Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT)
         } catch (e: Exception) {
             val eparams = pending[chainId]?.params ?: params
             val equiet = eparams["q"]?.toIntOrNull() ?: quiet
@@ -651,38 +670,6 @@ class KittyProtocolParser {
     private fun createPngBitmap(data: ByteArray): Bitmap? {
         if (data.isEmpty()) return null
         return BitmapFactory.decodeByteArray(data, 0, data.size)
-    }
-
-    /**
-     * Check if a string contains a Kitty graphics escape sequence.
-     */
-    fun containsKittySequence(text: String): Boolean {
-        return text.contains(APC_START) && text.contains(APC_END)
-    }
-
-    /**
-     * Extract all complete Kitty graphics sequences from text, in order.
-     */
-    fun extractSequences(text: String): List<String> {
-        return extractSequenceRanges(text).map { text.substring(it) }
-    }
-
-    fun extractSequenceRanges(text: String): List<IntRange> {
-        val ranges = mutableListOf<IntRange>()
-        var start = 0
-
-        while (true) {
-            val begin = text.indexOf(APC_START, start)
-            if (begin == -1) break
-
-            val end = text.indexOf(APC_END, begin)
-            if (end == -1) break
-
-            ranges.add(begin until end + APC_END.length)
-            start = end + APC_END.length
-        }
-
-        return ranges
     }
 }
 

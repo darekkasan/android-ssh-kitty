@@ -98,9 +98,6 @@ class TerminalViewModel @Inject constructor(
     val placedImages: StateFlow<List<PlacedImage>> = _placedImages
 
     private var viewportOffset = 0
-    // Raw output not yet processed. An incomplete trailing escape stays
-    // here until the rest arrives.
-    private var pendingRaw = StringBuilder()
     // Cell metrics (px) reported by the UI for image cell resolution.
     private var cellW = 10f
     private var cellH = 20f
@@ -148,9 +145,8 @@ class TerminalViewModel @Inject constructor(
                         sshConnectionManager.readFromTerminal()
                     }
                     if (data != null) {
-                        val text = String(data, Charsets.UTF_8)
                         withContext(parseDispatcher) {
-                            processTerminalOutput(text)
+                            processBytes(data)
                         }
                     } else {
                         // Idle: back off. Busy: drain immediately.
@@ -167,20 +163,9 @@ class TerminalViewModel @Inject constructor(
         }
     }
 
-    private fun processTerminalOutput(text: String) {
+    private fun processBytes(data: ByteArray) {
         try {
-            pendingRaw.append(text)
-            val (complete, rest) = splitCompleteEscape(pendingRaw.toString())
-            // Cap the hold-back so an abandoned escape can never grow
-            // unbounded: flush it as plain text.
-            pendingRaw = if (rest.length > 1_000_000) {
-                StringBuilder()
-            } else {
-                StringBuilder(rest)
-            }
-            val raw = if (rest.length > 1_000_000) complete + rest else complete
-            if (raw.isEmpty()) return
-            val events = kittyRenderer.processOutput(raw).events
+            val events = kittyRenderer.processBytes(data).events
             // Pure chunk traffic (m=1 data) emits nothing visible: skip
             // the whole viewport rebuild + recompose for those. At video
             // rates this avoids hundreds of redundant UI passes.
@@ -201,34 +186,6 @@ class TerminalViewModel @Inject constructor(
         } catch (e: Exception) {
             // Log error but don't crash
             e.printStackTrace()
-        }
-    }
-
-    /**
-     * Split raw output into a complete prefix and a trailing incomplete
-     * escape sequence (CSI/OSC/DCS/APC/etc. split across reads).
-     */
-    private fun splitCompleteEscape(raw: String): Pair<String, String> {
-        val esc = raw.lastIndexOf('\u001B')
-        if (esc == -1) return raw to ""
-        val tail = raw.substring(esc)
-        return if (isCompleteEscape(tail)) raw to ""
-        else raw.substring(0, esc) to tail
-    }
-
-    private fun isCompleteEscape(tail: String): Boolean {
-        if (tail.length < 2) return false
-        return when (tail[1]) {
-            '[' -> {
-                var i = 2
-                while (i < tail.length && tail[i] in '0'..'?') i++
-                while (i < tail.length && tail[i] in ' '..'/') i++
-                i < tail.length
-            }
-            ']', 'P', 'X', '^', '_' ->
-                tail.contains('\u0007') || tail.contains("\u001B\\")
-            '#', '(', ')', '%', '&' -> tail.length >= 3
-            else -> true
         }
     }
 
