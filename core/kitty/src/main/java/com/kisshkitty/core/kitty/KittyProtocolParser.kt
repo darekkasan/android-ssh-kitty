@@ -168,23 +168,28 @@ class KittyProtocolParser {
             payload = content.substring(separatorIndex + 1)
         }
 
-        val params0 = parseControlData(controlData)
+        // The APC command code: every graphics sequence is ESC _ G ...,
+        // so the control data starts with a lone 'G'. Strip it, otherwise
+        // the first key parses as "Ga" and the action is lost.
+        val body = if (controlData.startsWith("G")) controlData.substring(1) else controlData
+
+        // Hot path: bare continuation markers (m=0/1, optional q) are
+        // >99% of video traffic. The chain they belong to is tracked
+        // separately, so skip map building entirely here.
+        if (body == "m=1" || body == "m=0" ||
+            body.startsWith("m=1,q=") || body.startsWith("m=0,q=")
+        ) {
+            return handleMarker(body, payload)
+        }
+
+        val params = parseControlData(body)
 
         // Foreign protocol responses (our own echoed replies, real
         // kitty replies, DA answers) always carry Gi and are never
         // client commands. Ignore them outright: parsing them as
         // anonymous uploads steals pending chunk state and the error
         // responses they spawn loop forever through pty echo.
-        if (params0.containsKey("Gi")) return emptyList()
-
-        // The APC command code: every graphics sequence is ESC _ G ...,
-        // so the control data starts with a lone 'G'. Strip it, otherwise
-        // the first key parses as "Ga" and the action is lost.
-        val params = if (controlData.startsWith("G")) {
-            parseControlData(controlData.substring(1))
-        } else {
-            params0
-        }
+        if (params.containsKey("Gi")) return emptyList()
 
         // A response echo looks like i=<id>[,p=<pid>];<message> with no
         // action key. No valid client command looks like that, so ignore
@@ -215,6 +220,74 @@ class KittyProtocolParser {
     // ------------------------------------------------------------------
     // Loading (transmit / query / frames)
     // ------------------------------------------------------------------
+
+    /**
+     * Bare continuation/final marker: "m=0", "m=1", "m=0,q=N" or
+     * "m=1,q=N". No map building on this hot path.
+     */
+    private fun handleMarker(control: String, payload: String): List<KittyEvent> {
+        val m: Int
+        val q: Int
+        when {
+            control == "m=1" -> { m = 1; q = 0 }
+            control == "m=0" -> { m = 0; q = 0 }
+            control.startsWith("m=1,q=") -> {
+                m = 1
+                q = control.substring(5).toIntOrNull() ?: return emptyList()
+            }
+            control.startsWith("m=0,q=") -> {
+                m = 0
+                q = control.substring(5).toIntOrNull() ?: return emptyList()
+            }
+            else -> return emptyList()
+        }
+        val cid = lastChainId
+        val state = cid?.let { pending[it] } ?: return emptyList()
+        if (m == 1) {
+            val data = try {
+                Base64.decode(payload, Base64.DEFAULT)
+            } catch (e: Exception) {
+                return abortChain(cid, state, "EINVAL: bad base64 payload")
+            }
+            state.data.write(data)
+            if (state.data.size() > MAX_PENDING_BYTES) {
+                return abortChain(cid, state, "ENOSPC: upload too large")
+            }
+            return emptyList()
+        }
+        // Final chunk: complete with the first chunk's control keys, so
+        // a=T never degrades to a silent transmit (and its q/i apply).
+        pending.remove(cid)
+        if (cid == lastChainId) lastChainId = null
+        val first = state.params
+        val complete = ByteArrayOutputStream().also { out ->
+            state.data.writeTo(out)
+            try {
+                out.write(Base64.decode(payload, Base64.DEFAULT))
+            } catch (e: Exception) {
+                return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
+            }
+        }.toByteArray()
+        val finalAction = first["a"] ?: ACTION_TRANSMIT
+        val finalQuiet = first["q"]?.toIntOrNull() ?: q
+        val finalCorrelate = first.containsKey("i") || first.containsKey("I")
+        return finishLoad(first, complete, finalAction, finalQuiet, cid, finalCorrelate)
+    }
+
+    private fun abortChain(
+        chainId: Int,
+        state: PendingUpload,
+        message: String,
+        completed: Boolean = false
+    ): List<KittyEvent> {
+        if (!completed) {
+            pending.remove(chainId)
+            if (chainId == lastChainId) lastChainId = null
+        }
+        val q = state.params["q"]?.toIntOrNull() ?: 0
+        val correlate = state.params.containsKey("i") || state.params.containsKey("I")
+        return err(q, chainId, message, correlate)
+    }
 
     private fun handleLoad(
         params: Map<String, String>,

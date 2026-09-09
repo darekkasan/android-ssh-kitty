@@ -180,7 +180,12 @@ class TerminalViewModel @Inject constructor(
             }
             val raw = if (rest.length > 1_000_000) complete + rest else complete
             if (raw.isEmpty()) return
-            for (event in kittyRenderer.processOutput(raw).events) {
+            val events = kittyRenderer.processOutput(raw).events
+            // Pure chunk traffic (m=1 data) emits nothing visible: skip
+            // the whole viewport rebuild + recompose for those. At video
+            // rates this avoids hundreds of redundant UI passes.
+            if (events.isEmpty()) return
+            for (event in events) {
                 when (event) {
                     is KittyImageRenderer.OutputEvent.Text ->
                         terminalEmulator.processOutput(event.text)
