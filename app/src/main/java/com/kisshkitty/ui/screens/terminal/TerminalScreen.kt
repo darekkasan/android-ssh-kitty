@@ -633,20 +633,27 @@ fun TerminalScreen(
         )
     }
     val terminalLineHeightSp = with(density) { cellMetrics.lineHeight.toSp() }
-    // Per-pair correction so a wide glyph + its cell is exactly two
-    // columns on this device's fallback font (trailing spacing is
-    // included in line width; the epsilon keeps rounding from wrapping).
-    // Self-adapting: proper 2x fonts compress the marker, narrow
-    // fallbacks stretch the pair.
-    val wideSpacingSp: TextUnit = with(density) {
-        val measure = android.graphics.Paint().apply {
-            typeface = Typeface.MONOSPACE
-            textSize = with(density) { TERMINAL_FONT_SIZE.toPx() }
+    // Measured once: per-pair CJK correction (see builder docs).
+    val wideSpacingSp = remember(density, cellMetrics) {
+        with(density) {
+            val measure = android.graphics.Paint().apply {
+                typeface = Typeface.MONOSPACE
+                textSize = with(density) { TERMINAL_FONT_SIZE.toPx() }
+            }
+            val wideAdvance = measure.measureText("あ")
+            val spaceAdvance = measure.measureText(" ")
+            ((2 * cellMetrics.charWidth - wideAdvance - spaceAdvance - 0.5f) / 2)
+                .coerceIn(-cellMetrics.charWidth, cellMetrics.charWidth).toSp()
         }
-        val wideAdvance = measure.measureText("あ")
-        val spaceAdvance = measure.measureText(" ")
-        ((2 * cellMetrics.charWidth - wideAdvance - spaceAdvance - 0.5f) / 2)
-            .coerceIn(-cellMetrics.charWidth, cellMetrics.charWidth).toSp()
+    }
+    val terminalTextStyle = remember(terminalLineHeightSp) {
+        TextStyle(
+            fontFamily = FontFamily.Monospace,
+            fontSize = TERMINAL_FONT_SIZE,
+            lineHeight = terminalLineHeightSp,
+            letterSpacing = 0.sp,
+            color = Color.White
+        )
     }
 
     // Visible text (standard Android selection) + its selection state.
@@ -856,19 +863,14 @@ fun TerminalScreen(
                     readOnly = true,
                     enabled = true,
                     interactionSource = visibleInteraction,
-                    textStyle = TextStyle(
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = TERMINAL_FONT_SIZE,
-                        lineHeight = terminalLineHeightSp,
-                        letterSpacing = 0.sp,
-                        color = Color.White
-                    ),
+                    textStyle = terminalTextStyle,
                     cursorBrush = SolidColor(Color.Transparent)
                 )
                 TerminalCanvas(
                     placedImages = placedImages,
                     windowStartLine = viewport.windowStart,
-                    cursorPosition = viewport.cursorX to viewport.cursorY,
+                    cursorX = viewport.cursorX,
+                    cursorY = viewport.cursorY,
                     cellWidth = cellMetrics.charWidth,
                     cellHeight = cellMetrics.lineHeight,
                     modifier = Modifier.fillMaxSize()
@@ -1117,7 +1119,8 @@ fun TerminalScreen(
 fun TerminalCanvas(
     placedImages: List<PlacedImage>,
     windowStartLine: Int,
-    cursorPosition: Pair<Int, Int>,
+    cursorX: Int,
+    cursorY: Int,
     cellWidth: Float,
     cellHeight: Float,
     modifier: Modifier = Modifier
@@ -1125,6 +1128,9 @@ fun TerminalCanvas(
     // Transparent overlay: text (with standard selection) is drawn by the
     // read-only field below; images and the block cursor live here so
     // they never force a text relayout.
+    val sorted = remember(placedImages) {
+        placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))
+    }
     Canvas(modifier = modifier) {
         fun drawPlaced(p: PlacedImage) {
             val bw = p.bitmap.width
@@ -1145,23 +1151,21 @@ fun TerminalCanvas(
         }
 
         // Images with negative z-index go under the text.
-        for (p in placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))) {
+        for (p in sorted) {
             if (p.zIndex < 0) drawPlaced(p)
         }
 
         // Images with non-negative z-index go over the text.
-        for (p in placedImages.sortedWith(compareBy({ it.zIndex }, { it.imageId }))) {
+        for (p in sorted) {
             if (p.zIndex >= 0) drawPlaced(p)
         }
 
         // Block cursor. -1 hides it (scrolled away or cursor hidden).
         // A rect, not a text span, so cursor motion is nearly free.
-        val cursorX = cursorPosition.first.coerceAtLeast(0)
-        val cursorY = cursorPosition.second
         if (cursorY >= 0) {
             drawRect(
                 color = Color.White,
-                topLeft = Offset(cursorX * cellWidth, cursorY * cellHeight),
+                topLeft = Offset(cursorX.coerceAtLeast(0) * cellWidth, cursorY * cellHeight),
                 size = androidx.compose.ui.geometry.Size(cellWidth, cellHeight),
                 alpha = 0.5f
             )
@@ -1209,15 +1213,17 @@ fun ScrollStrip(
                 )
             }
     ) {
+        val density = LocalDensity.current
+        val trackW = remember(density) { with(density) { 4.dp.toPx() } }
+        val thumbMinH = remember(density) { with(density) { 24.dp.toPx() } }
         Canvas(modifier = Modifier.fillMaxSize()) {
-            val trackW = 4.dp.toPx()
             drawRect(
                 color = Color.White,
                 topLeft = Offset((size.width - trackW) / 2, 0f),
                 size = androidx.compose.ui.geometry.Size(trackW, size.height),
                 alpha = 0.15f
             )
-            val thumbH = (size.height * thumbFraction).coerceAtLeast(24.dp.toPx())
+            val thumbH = (size.height * thumbFraction).coerceAtLeast(thumbMinH)
             val thumbY = ((size.height - thumbH) * (1f - thumbPos)).coerceIn(0f, size.height - thumbH)
             drawRect(
                 color = Color.White,

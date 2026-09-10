@@ -145,23 +145,58 @@ class KittyProtocolParser {
 
     private data class PendingUpload(
         var params: Map<String, String>,
-        val data: ByteArrayOutputStream = ByteArrayOutputStream()
+        /** Exact-size target when the total is known, else null. */
+        val exact: ByteArray?,
+        var filled: Int = 0,
+        /** Growable fallback for unknown sizes (e.g. PNG). */
+        val overflow: ByteArrayOutputStream? = null
     ) {
         companion object {
             /** Pre-sized accumulator when the total is known up front. */
             fun withExpected(params: Map<String, String>): PendingUpload {
-                return PendingUpload(params, ByteArrayOutputStream(expectedBytes(params)))
+                val expected = expectedBytes(params)
+                return if (expected > 0) {
+                    PendingUpload(params, ByteArray(expected))
+                } else {
+                    PendingUpload(params, null, 0, ByteArrayOutputStream(32))
+                }
             }
 
             private fun expectedBytes(params: Map<String, String>): Int {
                 // PNG size is unknowable up front (compressed): grow naturally.
-                if ((params["f"]?.toIntOrNull() ?: FORMAT_RGBA) == FORMAT_PNG) return 32
+                if ((params["f"]?.toIntOrNull() ?: FORMAT_RGBA) == FORMAT_PNG) return -1
                 val w = params["s"]?.toIntOrNull() ?: 0
                 val h = params["v"]?.toIntOrNull() ?: 0
-                if (w <= 0 || h <= 0) return 32
+                if (w <= 0 || h <= 0) return -1
                 val bpp = if ((params["f"]?.toIntOrNull() ?: FORMAT_RGBA) == FORMAT_RGB) 3 else 4
-                return (w.toLong() * h.toLong() * bpp).coerceAtMost(256L * 1024L * 1024L).toInt()
+                val total = w.toLong() * h.toLong() * bpp
+                if (total > 256L * 1024L * 1024L) return -1
+                return total.toInt()
             }
+        }
+
+        fun size(): Int = filled + (overflow?.size() ?: 0)
+
+        /** Append decoded bytes; false when they no longer fit (corrupt). */
+        fun append(data: ByteArray): Boolean {
+            val e = exact
+            if (e != null) {
+                if (data.size > e.size - filled) return false
+                System.arraycopy(data, 0, e, filled, data.size)
+                filled += data.size
+                return true
+            }
+            overflow!!.write(data)
+            return true
+        }
+
+        /** Assembled bytes (the exact array itself when complete). */
+        fun bytes(): ByteArray {
+            val e = exact
+            if (e != null) {
+                return if (filled == e.size) e else e.copyOf(filled)
+            }
+            return overflow!!.toByteArray()
         }
     }
 
@@ -312,8 +347,10 @@ class KittyProtocolParser {
             } catch (e: Exception) {
                 return abortChain(cid, state, "EINVAL: bad base64 payload")
             }
-            state.data.write(data)
-            if (state.data.size() > MAX_PENDING_BYTES) {
+            if (!state.append(data)) {
+                return abortChain(cid, state, "EINVAL: upload exceeds declared size")
+            }
+            if (state.size() > MAX_PENDING_BYTES) {
                 return abortChain(cid, state, "ENOSPC: upload too large")
             }
             return emptyList()
@@ -328,11 +365,11 @@ class KittyProtocolParser {
         } catch (e: Exception) {
             return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
         }
-        val complete = if (state.data.size() > 0) {
-            ByteArrayOutputStream(state.data.size() + finalData.size).also { out ->
-                state.data.writeTo(out)
-                out.write(finalData)
-            }.toByteArray()
+        val complete = if (state.size() > 0) {
+            if (!state.append(finalData)) {
+                return abortChain(cid, state, "EINVAL: upload exceeds declared size", completed = true)
+            }
+            state.bytes()
         } else {
             finalData
         }
@@ -430,8 +467,14 @@ class KittyProtocolParser {
 
         if (more == 1) {
             val state = pending.getOrPut(chainId) { PendingUpload.withExpected(chainParams) }
-            state.data.write(data)
-            if (state.data.size() > MAX_PENDING_BYTES) {
+            if (!state.append(data)) {
+                pending.remove(chainId)
+                if (chainId == lastChainId) lastChainId = null
+                val eq = chainParams["q"]?.toIntOrNull() ?: quiet
+                val ec = chainParams.containsKey("i") || chainParams.containsKey("I")
+                return err(eq, chainId, "EINVAL: upload exceeds declared size", ec)
+            }
+            if (state.size() > MAX_PENDING_BYTES) {
                 pending.remove(chainId)
                 if (chainId == lastChainId) lastChainId = null
                 val eq = chainParams["q"]?.toIntOrNull() ?: quiet
@@ -455,13 +498,17 @@ class KittyProtocolParser {
             }
         }
         val effective = if (first != null) first.params else chainParams
-        // Single-chunk uploads use the decoded bytes directly instead
-        // of copying them through a fresh accumulator.
-        val complete = if (first != null && first.data.size() > 0) {
-            ByteArrayOutputStream(first.data.size() + data.size).also { out ->
-                first.data.writeTo(out)
-                out.write(data)
-            }.toByteArray()
+        // Accumulated bytes are used in place when complete; single
+        // chunks skip the accumulator entirely.
+        val complete = if (first != null && first.size() > 0) {
+            if (!first.append(data)) {
+                return err(
+                    effective["q"]?.toIntOrNull() ?: quiet, chainId,
+                    "EINVAL: upload exceeds declared size",
+                    effective.containsKey("i") || effective.containsKey("I")
+                )
+            }
+            first.bytes()
         } else {
             data
         }
