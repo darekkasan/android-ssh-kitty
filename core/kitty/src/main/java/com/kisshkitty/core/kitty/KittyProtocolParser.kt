@@ -56,6 +56,20 @@ class KittyProtocolParser {
         const val MAX_STORED_IMAGES = 64
         /** Cap on stored image pixels (bitmaps live in placed refs anyway). */
         const val MAX_STORED_BYTES = 96 * 1024 * 1024
+
+        /** Cumulative stage nanos for diagnostics (single-threaded use). */
+        var dbgParseNanos = 0L
+        var dbgDecodeNanos = 0L
+        var dbgBitmapNanos = 0L
+        var dbgSeqs = 0L
+
+        @JvmStatic
+        fun dbgReset() {
+            dbgParseNanos = 0L
+            dbgDecodeNanos = 0L
+            dbgBitmapNanos = 0L
+            dbgSeqs = 0L
+        }
     }
 
     /**
@@ -196,6 +210,21 @@ class KittyProtocolParser {
      * @param payload raw payload bytes
      */
     fun parseControl(controlData: String, payload: ByteArray, payloadOff: Int, payloadLen: Int): List<KittyEvent> {
+        val t0 = System.nanoTime()
+        try {
+            return parseControlInner(controlData, payload, payloadOff, payloadLen)
+        } finally {
+            dbgParseNanos += System.nanoTime() - t0
+            dbgSeqs++
+        }
+    }
+
+    private fun parseControlInner(
+        controlData: String,
+        payload: ByteArray,
+        payloadOff: Int,
+        payloadLen: Int
+    ): List<KittyEvent> {
 
         // The APC command code: every graphics sequence is ESC _ G ...,
         // so the control data starts with a lone 'G'. Strip it, otherwise
@@ -279,7 +308,7 @@ class KittyProtocolParser {
         val state = cid?.let { pending[it] } ?: return emptyList()
         if (m == 1) {
             val data = try {
-                Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT)
+                decodeB64(payload, payloadOff, payloadLen)
             } catch (e: Exception) {
                 return abortChain(cid, state, "EINVAL: bad base64 payload")
             }
@@ -295,7 +324,7 @@ class KittyProtocolParser {
         if (cid == lastChainId) lastChainId = null
         val first = state.params
         val finalData = try {
-            Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT)
+            decodeB64(payload, payloadOff, payloadLen)
         } catch (e: Exception) {
             return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
         }
@@ -311,6 +340,15 @@ class KittyProtocolParser {
         val finalQuiet = first["q"]?.toIntOrNull() ?: q
         val finalCorrelate = first.containsKey("i") || first.containsKey("I")
         return finishLoad(first, complete, finalAction, finalQuiet, cid, finalCorrelate)
+    }
+
+    private fun decodeB64(payload: ByteArray, off: Int, len: Int): ByteArray {
+        val t0 = System.nanoTime()
+        try {
+            return Base64.decode(payload, off, len, Base64.DEFAULT)
+        } finally {
+            dbgDecodeNanos += System.nanoTime() - t0
+        }
     }
 
     private fun abortChain(
@@ -380,7 +418,7 @@ class KittyProtocolParser {
 
         val more = params["m"]?.toIntOrNull() ?: 0
         val data = try {
-            Base64.decode(payload, payloadOff, payloadLen, Base64.DEFAULT)
+            decodeB64(payload, payloadOff, payloadLen)
         } catch (e: Exception) {
             val eparams = pending[chainId]?.params ?: params
             val equiet = eparams["q"]?.toIntOrNull() ?: quiet
@@ -660,6 +698,15 @@ class KittyProtocolParser {
     }
 
     private fun createRgbBitmap(data: ByteArray, width: Int, height: Int): Bitmap? {
+        val bt0 = System.nanoTime()
+        try {
+            return createRgbBitmapInner(data, width, height)
+        } finally {
+            dbgBitmapNanos += System.nanoTime() - bt0
+        }
+    }
+
+    private fun createRgbBitmapInner(data: ByteArray, width: Int, height: Int): Bitmap? {
         if (width <= 0 || height <= 0) return null
         if (data.size < width * height * 3) return null
 
@@ -681,6 +728,15 @@ class KittyProtocolParser {
     }
 
     private fun createRgbaBitmap(data: ByteArray, width: Int, height: Int): Bitmap? {
+        val bt0 = System.nanoTime()
+        try {
+            return createRgbaBitmapInner(data, width, height)
+        } finally {
+            dbgBitmapNanos += System.nanoTime() - bt0
+        }
+    }
+
+    private fun createRgbaBitmapInner(data: ByteArray, width: Int, height: Int): Bitmap? {
         if (width <= 0 || height <= 0) return null
         val need = width * height * 4
         if (data.size < need) return null
@@ -696,6 +752,15 @@ class KittyProtocolParser {
     }
 
     private fun createPngBitmap(data: ByteArray): Bitmap? {
+        val bt0 = System.nanoTime()
+        try {
+            return createPngBitmapInner(data)
+        } finally {
+            dbgBitmapNanos += System.nanoTime() - bt0
+        }
+    }
+
+    private fun createPngBitmapInner(data: ByteArray): Bitmap? {
         if (data.isEmpty()) return null
         // Prefer GPU-resident bitmaps: zero app-heap pixels and no
         // upload on draw. Falls back for oversized/odd PNGs.

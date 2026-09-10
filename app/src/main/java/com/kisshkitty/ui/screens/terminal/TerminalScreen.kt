@@ -141,25 +141,37 @@ class TerminalViewModel @Inject constructor(
 
     private fun startReadingOutput() {
         readingJob = viewModelScope.launch {
-            while (sshConnectionManager.isConnected()) {
-                try {
-                    val data = withContext(Dispatchers.IO) {
-                        sshConnectionManager.readFromTerminal()
-                    }
-                    if (data != null) {
-                        withContext(parseDispatcher) {
-                            processBytes(data)
+            try {
+                while (sshConnectionManager.isConnected()) {
+                    try {
+                        val data = withContext(Dispatchers.IO) {
+                            sshConnectionManager.readFromTerminal()
                         }
-                    } else {
-                        // Idle: back off. Busy: drain immediately.
-                        delay(16)
+                        if (data != null) {
+                            withContext(parseDispatcher) {
+                                processBytes(data)
+                            }
+                        } else {
+                            // Idle: back off. Busy: drain immediately.
+                            delay(16)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // Never let one bad chunk silently kill the loop.
+                        e.printStackTrace()
                     }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    // Never let one bad chunk silently kill the loop.
-                    e.printStackTrace()
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // Anything else (e.g. Errors) used to die silently here,
+                // freezing the terminal with "Connected" still showing.
+                // Surface it instead.
+                _terminalState.value = TerminalState.Error(
+                    "reader stopped: ${t.message ?: t.javaClass.simpleName}"
+                )
+                return@launch
             }
             _terminalState.value = TerminalState.Disconnected
         }
@@ -915,7 +927,14 @@ fun TerminalScreen(
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         } else {
-                            repeat(old.length - common) { viewModel.sendInput(DELETE_CHAR) }
+                            // At most one Backspace per event: the IME can
+                            // report a stale base after our rare resets, and
+                            // unbounded diffs would then eat live prompt
+                            // text. Genuine multi-deletes arrive as
+                            // separate events (or via the empty branch).
+                            repeat((old.length - common).coerceIn(0, 1)) {
+                                viewModel.sendInput(DELETE_CHAR)
+                            }
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         }
