@@ -3,6 +3,7 @@ package com.kisshkitty.ui.screens.terminal
 import android.content.Context
 import android.content.Intent
 import android.graphics.Typeface
+import android.util.Log
 import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
@@ -179,7 +180,30 @@ class TerminalViewModel @Inject constructor(
 
     private fun processBytes(data: ByteArray) {
         try {
+            // Bench hook: snapshot stage counters so one logcat line per
+            // displayed frame shows wall + parse/decode/bitmap ms inside
+            // kissh. Only logs when a Show event fires (video/image
+            // frames), so idle shell traffic stays quiet.
+            val p0 = KittyProtocolParser.dbgParseNanos
+            val d0 = KittyProtocolParser.dbgDecodeNanos
+            val b0 = KittyProtocolParser.dbgBitmapNanos
+            val t0 = System.nanoTime()
             val events = kittyRenderer.processBytes(data).events
+            val wallMs = (System.nanoTime() - t0) / 1_000_000.0
+            var shows = 0
+            for (e in events) if (e is KittyImageRenderer.OutputEvent.Show) shows++
+            if (shows > 0) {
+                val parseMs = (KittyProtocolParser.dbgParseNanos - p0) / 1_000_000.0
+                val decMs = (KittyProtocolParser.dbgDecodeNanos - d0) / 1_000_000.0
+                val bmpMs = (KittyProtocolParser.dbgBitmapNanos - b0) / 1_000_000.0
+                Log.d(
+                    "KisshBench",
+                    "bytes=${data.size} wall=${"%.1f".format(wallMs)}ms " +
+                        "parse=${"%.1f".format(parseMs)}ms " +
+                        "decode=${"%.1f".format(decMs)}ms " +
+                        "bitmap=${"%.1f".format(bmpMs)}ms shows=$shows"
+                )
+            }
             // Pure chunk traffic (m=1 data) emits nothing visible: skip
             // the whole viewport rebuild + recompose for those. At video
             // rates this avoids hundreds of redundant UI passes.

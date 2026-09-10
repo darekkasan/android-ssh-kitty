@@ -122,6 +122,7 @@ class SshConnectionManager @Inject constructor() {
             val n = input.read(buffer, 0, MAX_READ_BYTES)
             if (n <= 0) null else buffer.copyOf(n)
         } catch (e: Exception) {
+            Log.e("SshConnectionManager", "Read failed", e)
             null
         }
     }
