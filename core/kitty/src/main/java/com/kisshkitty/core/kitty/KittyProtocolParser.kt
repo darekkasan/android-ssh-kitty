@@ -466,6 +466,14 @@ class KittyProtocolParser {
         }
 
         if (more == 1) {
+            // A chunk carrying image keys OPENS a new chain: discard any
+            // stale partial upload on this id first. Otherwise one lost
+            // final chunk poisons every later image sharing the chain
+            // (frozen picture forever, silently).
+            if (params.keys.any { it == "f" || it == "s" || it == "v" || it == "i" || it == "I" || it == "t" || it == "o" }) {
+                pending.remove(chainId)
+                if (chainId == lastChainId) lastChainId = null
+            }
             val state = pending.getOrPut(chainId) { PendingUpload.withExpected(chainParams) }
             if (!state.append(data)) {
                 pending.remove(chainId)
