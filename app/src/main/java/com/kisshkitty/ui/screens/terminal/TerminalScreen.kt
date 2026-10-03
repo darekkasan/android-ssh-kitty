@@ -199,7 +199,8 @@ class TerminalViewModel @Inject constructor(
                     "bytes=$len wall=${"%.1f".format(wallMs)}ms " +
                         "parse=${"%.1f".format(parseMs)}ms " +
                         "decode=${"%.1f".format(decMs)}ms " +
-                        "bitmap=${"%.1f".format(bmpMs)}ms shows=$shows"
+                        "bitmap=${"%.1f".format(bmpMs)}ms shows=$shows " +
+                        "backlog=${sshConnectionManager.pendingBytes()}"
                 )
             }
             // Pure chunk traffic (m=1 data) emits nothing visible: skip

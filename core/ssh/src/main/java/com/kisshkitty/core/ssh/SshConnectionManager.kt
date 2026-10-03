@@ -102,17 +102,28 @@ class SshConnectionManager @Inject constructor() {
     private val writeMutex = Mutex()
 
     suspend fun writeToTerminal(data: ByteArray) {
+        val queued = System.nanoTime()
         writeMutex.withLock {
+            val waitMs = (System.nanoTime() - queued) / 1_000_000
             withContext(Dispatchers.IO) {
                 try {
+                    val w0 = System.nanoTime()
                     outputStream?.write(data)
                     outputStream?.flush()
+                    val writeMs = (System.nanoTime() - w0) / 1_000_000
+                    // Bench hook: slow input path (lock wait or blocked write).
+                    if (waitMs > 50 || writeMs > 50) {
+                        Log.d("KisshBench", "input slow: lockWait=${waitMs}ms write=${writeMs}ms")
+                    }
                 } catch (e: Exception) {
                     Log.e("SshConnectionManager", "Write failed", e)
                 }
             }
         }
     }
+
+    /** Bytes already received but not yet read (diagnostics: backlog). */
+    fun pendingBytes(): Int = try { inputStream?.available() ?: 0 } catch (e: Exception) { 0 }
 
     /** Single reusable read buffer: only the reader loop touches it. */
     val readBuffer = ByteArray(MAX_BATCH_BYTES)
