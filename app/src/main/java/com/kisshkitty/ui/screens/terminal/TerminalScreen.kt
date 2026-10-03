@@ -681,7 +681,15 @@ fun TerminalScreen(
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
-    var inputText by remember { mutableStateOf(INPUT_SENTINEL) }
+    // The caret must always sit AFTER the sentinel. A plain String value
+    // leaves it before the sentinel until the first reset, so typed text
+    // landed in front of it and the diff misread "ab<S>" as a Backspace.
+    var inputField by remember {
+        mutableStateOf(TextFieldValue(INPUT_SENTINEL, TextRange(INPUT_SENTINEL.length)))
+    }
+    fun setInput(text: String) {
+        inputField = TextFieldValue(text, TextRange(text.length))
+    }
     var isTextFieldPlaced by remember { mutableStateOf(false) }
     var showKeys by remember { mutableStateOf(false) }
     var scrollAcc by remember { mutableFloatStateOf(0f) }
@@ -978,20 +986,21 @@ fun TerminalScreen(
             // same as Termux and our special-key path), never BS (0x08)
             // which canonical-mode line disciplines ignore.
             BasicTextField(
-                value = inputText,
-                onValueChange = { newValue ->
+                value = inputField,
+                onValueChange = { fieldChange ->
+                    val newValue = fieldChange.text
                     // Accumulate: commits stick so the IME never desyncs
                     // (reverting every keystroke freezes Gboard after a
                     // couple of chars). Resets happen only on line submit
                     // or full clear, like a real line discipline.
-                    val old = inputText
+                    val old = inputField.text
                     if (newValue.isEmpty()) {
                         // Sentinel itself deleted: real Backspace, then
                         // restore it so the key keeps working.
                         if (old.isNotEmpty()) {
                             viewModel.sendInput(DELETE_CHAR)
                         }
-                        inputText = INPUT_SENTINEL
+                        setInput(INPUT_SENTINEL)
                     } else {
                         val common = newValue.commonPrefixWith(old).length
                         val added = newValue.substring(common)
@@ -1017,7 +1026,7 @@ fun TerminalScreen(
                             val text = clean(added)
                             if (text.isNotEmpty()) viewModel.sendInput(text)
                         }
-                        inputText = if (newValue.length > 512) INPUT_SENTINEL else newValue
+                        setInput(if (newValue.length > 512) INPUT_SENTINEL else newValue)
                     }
                 },
                 modifier = Modifier
@@ -1037,7 +1046,7 @@ fun TerminalScreen(
                 keyboardActions = KeyboardActions(
                     onSend = {
                         viewModel.sendInput("\r")
-                        inputText = INPUT_SENTINEL
+                        setInput(INPUT_SENTINEL)
                     }
                 ),
                 singleLine = false,
