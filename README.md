@@ -1,6 +1,6 @@
 # KisshKitty
 
-> **Note**: This project was developed with the assistance of AI (OpenCode).
+> **Note**: This README says OpenCode, but I'm actually on a temporary break with Claude Code.
 
 A modern SSH client for Android with Kitty image protocol support.
 
