@@ -145,16 +145,14 @@ class TerminalViewModel @Inject constructor(
             try {
                 while (sshConnectionManager.isConnected()) {
                     try {
-                        val data = withContext(Dispatchers.IO) {
+                        val n = withContext(Dispatchers.IO) {
                             sshConnectionManager.readFromTerminal()
                         }
-                        if (data != null) {
+                        if (n < 0) break // EOF or closed
+                        if (n > 0) {
                             withContext(parseDispatcher) {
-                                processBytes(data)
+                                processBytes(sshConnectionManager.readBuffer, n)
                             }
-                        } else {
-                            // Idle: back off. Busy: drain immediately.
-                            delay(16)
                         }
                     } catch (e: CancellationException) {
                         throw e
@@ -178,7 +176,7 @@ class TerminalViewModel @Inject constructor(
         }
     }
 
-    private fun processBytes(data: ByteArray) {
+    private fun processBytes(data: ByteArray, len: Int) {
         try {
             // Bench hook: snapshot stage counters so one logcat line per
             // displayed frame shows wall + parse/decode/bitmap ms inside
@@ -188,7 +186,7 @@ class TerminalViewModel @Inject constructor(
             val d0 = KittyProtocolParser.dbgDecodeNanos
             val b0 = KittyProtocolParser.dbgBitmapNanos
             val t0 = System.nanoTime()
-            val events = kittyRenderer.processBytes(data).events
+            val events = kittyRenderer.processBytes(data, len).events
             val wallMs = (System.nanoTime() - t0) / 1_000_000.0
             var shows = 0
             for (e in events) if (e is KittyImageRenderer.OutputEvent.Show) shows++
@@ -198,7 +196,7 @@ class TerminalViewModel @Inject constructor(
                 val bmpMs = (KittyProtocolParser.dbgBitmapNanos - b0) / 1_000_000.0
                 Log.d(
                     "KisshBench",
-                    "bytes=${data.size} wall=${"%.1f".format(wallMs)}ms " +
+                    "bytes=$len wall=${"%.1f".format(wallMs)}ms " +
                         "parse=${"%.1f".format(parseMs)}ms " +
                         "decode=${"%.1f".format(decMs)}ms " +
                         "bitmap=${"%.1f".format(bmpMs)}ms shows=$shows"

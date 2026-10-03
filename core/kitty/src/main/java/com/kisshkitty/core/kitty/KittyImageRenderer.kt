@@ -34,11 +34,22 @@ class KittyImageRenderer {
      * Process raw output bytes. Complete units become events; a trailing
      * incomplete escape (or split UTF-8 tail) is held for the next call.
      */
-    fun processBytes(data: ByteArray): KittyOutput {
-        val buf = if (pending.isEmpty()) data else pending + data
+    fun processBytes(data: ByteArray, len: Int = data.size): KittyOutput {
+        // [data] may be a caller-owned reused buffer: nothing below keeps
+        // a reference to it (payloads/text are copied, the tail is cloned).
+        val buf: ByteArray
+        val n: Int
+        if (pending.isEmpty()) {
+            buf = data
+            n = len
+        } else {
+            n = pending.size + len
+            buf = ByteArray(n)
+            System.arraycopy(pending, 0, buf, 0, pending.size)
+            System.arraycopy(data, 0, buf, pending.size, len)
+        }
         pending = ByteArray(0)
         val events = mutableListOf<OutputEvent>()
-        val n = buf.size
         var pos = 0
         var textStart = 0
 

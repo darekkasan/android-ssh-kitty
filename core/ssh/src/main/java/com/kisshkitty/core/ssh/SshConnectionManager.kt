@@ -110,20 +110,22 @@ class SshConnectionManager @Inject constructor() {
         }
     }
 
-    fun readFromTerminal(): ByteArray? {
+    /** Single reusable read buffer: only the reader loop touches it. */
+    val readBuffer = ByteArray(MAX_READ_BYTES)
+
+    /**
+     * Blocks until output arrives, then reads once into [readBuffer].
+     * Returns the byte count, or -1 on EOF/error. Call from an IO thread;
+     * disconnect() closes the stream, which unblocks a pending read.
+     * No polling delay: a frame is parsed the moment it arrives.
+     */
+    fun readFromTerminal(): Int {
         return try {
-            val input = inputStream ?: return null
-            if (input.available() <= 0) return null
-            // Exactly one read: it returns what is there right now.
-            // Waiting for more inside the poll loop can block forever
-            // (killing all output incl. typed echo); leftovers are
-            // picked up on the next poll 16ms later.
-            val buffer = ByteArray(MAX_READ_BYTES)
-            val n = input.read(buffer, 0, MAX_READ_BYTES)
-            if (n <= 0) null else buffer.copyOf(n)
+            val input = inputStream ?: return -1
+            input.read(readBuffer, 0, MAX_READ_BYTES)
         } catch (e: Exception) {
             Log.e("SshConnectionManager", "Read failed", e)
-            null
+            -1
         }
     }
 
