@@ -18,6 +18,8 @@ class KittyImageRenderer {
 
     /** Unprocessed tail: at most one incomplete escape sequence. */
     private var pending = ByteArray(0)
+    /** Last time the held-back tail was extended (nanoTime). */
+    private var pendingStamp = 0L
 
     sealed interface OutputEvent {
         data class Text(val text: String) : OutputEvent
@@ -37,6 +39,14 @@ class KittyImageRenderer {
     fun processBytes(data: ByteArray, len: Int = data.size): KittyOutput {
         // [data] may be a caller-owned reused buffer: nothing below keeps
         // a reference to it (payloads/text are copied, the tail is cloned).
+        // An unterminated escape (killed program, lost bytes) would
+        // otherwise swallow every later byte, prompt and echo included.
+        // A partial sequence idle for this long is certainly abandoned.
+        if (pending.isNotEmpty() &&
+            System.nanoTime() - pendingStamp > PENDING_IDLE_NANOS
+        ) {
+            pending = ByteArray(0)
+        }
         val buf: ByteArray
         val n: Int
         if (pending.isEmpty()) {
@@ -131,6 +141,7 @@ class KittyImageRenderer {
         }
         if (pos < n) {
             pending = buf.copyOfRange(pos, n)
+            pendingStamp = System.nanoTime()
         }
         return KittyOutput(events)
     }
@@ -211,4 +222,8 @@ class KittyImageRenderer {
     }
 
     fun getParser(): KittyProtocolParser = parser
+
+    private companion object {
+        const val PENDING_IDLE_NANOS = 3_000_000_000L
+    }
 }
