@@ -25,6 +25,8 @@ class KittyImageRenderer {
     private var holdLen = 0
     /** Last time the held-back tail was extended (nanoTime). */
     private var pendingStamp = 0L
+    /** Set by escapeEnd when a string sequence was cut off by a new ESC. */
+    private var cancelled = false
 
     sealed interface OutputEvent {
         data class Text(val text: String) : OutputEvent
@@ -94,6 +96,20 @@ class KittyImageRenderer {
                 flushText(esc)
                 pos = esc
                 break
+            }
+            if (cancelled) {
+                // A string sequence was cut off (killed sender): drop its
+                // bytes, and any upload that depended on it, then resume
+                // normal scanning at the interrupting ESC.
+                flushText(esc)
+                if (esc + 2 < n && buf[esc + 1] == '_'.code.toByte() &&
+                    buf[esc + 2] == 'G'.code.toByte()
+                ) {
+                    parser.abortPendingUploads()
+                }
+                pos = end
+                textStart = end
+                continue
             }
             if (isGraphicsApc(buf, esc, end)) {
                 flushText(esc)
@@ -174,6 +190,7 @@ class KittyImageRenderer {
 
     /** Exclusive end index of the escape starting at [esc], or -1. */
     private fun escapeEnd(buf: ByteArray, esc: Int, n: Int, resumeAt: Int = 0): Int {
+        cancelled = false
         if (esc + 1 >= n) return -1
         return when (buf[esc + 1].toInt().toChar()) {
             '[' -> {
@@ -187,10 +204,11 @@ class KittyImageRenderer {
                 while (i < n) {
                     val b = buf[i].toInt() and 0xFF
                     if (b == 0x07) return i + 1
-                    if (b == 0x1B && i + 1 < n &&
-                        (buf[i + 1].toInt() and 0xFF) == 0x5C
-                    ) {
-                        return i + 2
+                    if (b == 0x1B && i + 1 < n) {
+                        if ((buf[i + 1].toInt() and 0xFF) == 0x5C) return i + 2
+                        // ESC not followed by '\\' cancels the string.
+                        cancelled = true
+                        return i
                     }
                     i++
                 }

@@ -885,20 +885,24 @@ class TerminalEmulator(
         val maxOff = (total - rows).coerceAtLeast(0)
         val off = offsetFromBottom.coerceIn(0, maxOff)
         val start = total - rows - off
-        val chars = Array(rows) { r ->
+        // One pass over the visible rows, all three planes together.
+        val chars = arrayOfNulls<CharArray>(rows)
+        val fg = arrayOfNulls<IntArray>(rows)
+        val bg = arrayOfNulls<IntArray>(rows)
+        val sbSize = scrollback.size
+        for (r in 0 until rows) {
             val abs = start + r
-            if (abs < scrollback.size) scrollback[abs].chars.copyOf()
-            else buffer[(abs - scrollback.size).coerceIn(0, (buffer.size - 1).coerceAtLeast(0))].copyOf()
-        }
-        val fg = Array(rows) { r ->
-            val abs = start + r
-            if (abs < scrollback.size) scrollback[abs].fg.copyOf()
-            else fgColors[(abs - scrollback.size).coerceIn(0, (fgColors.size - 1).coerceAtLeast(0))].copyOf()
-        }
-        val bg = Array(rows) { r ->
-            val abs = start + r
-            if (abs < scrollback.size) scrollback[abs].bg.copyOf()
-            else bgColors[(abs - scrollback.size).coerceIn(0, (bgColors.size - 1).coerceAtLeast(0))].copyOf()
+            if (abs < sbSize) {
+                val line = scrollback[abs]
+                chars[r] = line.chars.copyOf()
+                fg[r] = line.fg.copyOf()
+                bg[r] = line.bg.copyOf()
+            } else {
+                val y = (abs - sbSize).coerceIn(0, (buffer.size - 1).coerceAtLeast(0))
+                chars[r] = buffer[y].copyOf()
+                fg[r] = fgColors[y.coerceAtMost((fgColors.size - 1).coerceAtLeast(0))].copyOf()
+                bg[r] = bgColors[y.coerceAtMost((bgColors.size - 1).coerceAtLeast(0))].copyOf()
+            }
         }
         val cursorAbs = scrollback.size + cursorY
         val cy = if (cursorVisible && cursorAbs in start until start + rows) {
@@ -906,7 +910,11 @@ class TerminalEmulator(
         } else {
             -1
         }
-        return EmulatorWindow(chars, fg, bg, start, total, off, maxOff, cursorX, cy)
+        @Suppress("UNCHECKED_CAST")
+        return EmulatorWindow(
+            chars as Array<CharArray>, fg as Array<IntArray>, bg as Array<IntArray>,
+            start, total, off, maxOff, cursorX, cy
+        )
     }
 
     fun getScrollbackSize(): Int = scrollback.size

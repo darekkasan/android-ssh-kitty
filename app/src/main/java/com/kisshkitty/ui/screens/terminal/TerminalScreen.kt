@@ -109,6 +109,23 @@ class TerminalViewModel @Inject constructor(
     // touched concurrently. Only StateFlows cross threads (safe).
     private val parseDispatcher = Dispatchers.Default.limitedParallelism(1)
 
+    // Pooled bitmaps/buffers are only worth keeping while frames flow.
+    private var lastShowNanos = 0L
+
+    init {
+        viewModelScope.launch(parseDispatcher) {
+            while (true) {
+                delay(3000)
+                val last = lastShowNanos
+                if (last != 0L && System.nanoTime() - last > 3_000_000_000L) {
+                    lastShowNanos = 0L
+                    BitmapPool.clear()
+                    KittyProtocolParser.trimMemory()
+                }
+            }
+        }
+    }
+
     fun connect(hostId: String) {
         viewModelScope.launch {
             _terminalState.value = TerminalState.Connecting
@@ -190,7 +207,7 @@ class TerminalViewModel @Inject constructor(
             val wallMs = (System.nanoTime() - t0) / 1_000_000.0
             var shows = 0
             for (e in events) if (e is KittyImageRenderer.OutputEvent.Show) shows++
-            if (shows > 0) {
+            if (BENCH_LOG && shows > 0) {
                 val parseMs = (KittyProtocolParser.dbgParseNanos - p0) / 1_000_000.0
                 val decMs = (KittyProtocolParser.dbgDecodeNanos - d0) / 1_000_000.0
                 val bmpMs = (KittyProtocolParser.dbgBitmapNanos - b0) / 1_000_000.0
@@ -229,15 +246,18 @@ class TerminalViewModel @Inject constructor(
                         } else {
                             showImage(event.image, event.op)
                         }
-                    is KittyImageRenderer.OutputEvent.Delete ->
+                    is KittyImageRenderer.OutputEvent.Delete -> {
+                        flushAnonymous()
                         applyDelete(event.selector)
+                    }
                     is KittyImageRenderer.OutputEvent.Respond ->
                         sendInput(event.payload)
                 }
             }
             // Image-only batches (cursor parked, no text change) leave the
             // text window identical: skip the rebuild + recompose.
-            if (viewportSignature() != before) refreshViewport()
+            flushAnonymous()
+            if (viewportSignature() != before) publishViewport()
         } catch (e: Exception) {
             // Log error but don't crash
             e.printStackTrace()
@@ -260,9 +280,8 @@ class TerminalViewModel @Inject constructor(
         terminalEmulator.cursorVisible
     )
 
-    /** A superseded frame: no bitmap, no placement, same cursor motion. */
-    private fun skipImage(image: KittyImage, op: KittyProtocolParser.ShowOp) {
-        if (op.noCursorMove) return
+    /** Size in pixels of the source rectangle a placement shows. */
+    private fun croppedSize(image: KittyImage, op: KittyProtocolParser.ShowOp): Pair<Int, Int> {
         var w = image.width
         var h = image.height
         if (op.srcW > 0 && op.srcH > 0) {
@@ -271,19 +290,81 @@ class TerminalViewModel @Inject constructor(
             w = op.srcW.coerceIn(1, (w - x).coerceAtLeast(1))
             h = op.srcH.coerceIn(1, (h - y).coerceAtLeast(1))
         }
+        return w to h
+    }
+
+    /** A superseded frame: no bitmap, no placement, same cursor motion. */
+    private fun skipImage(image: KittyImage, op: KittyProtocolParser.ShowOp) {
+        if (op.noCursorMove) return
+        val (w, h) = croppedSize(image, op)
         val (cols, rows) = resolveCells(op, w, h)
         terminalEmulator.advanceForImage(cols, rows)
     }
 
+    private data class AnonKey(
+        val col: Int,
+        val line: Int,
+        val cols: Int,
+        val rows: Int,
+        val z: Int,
+        val xOff: Int,
+        val yOff: Int
+    )
+
+    private class PendingAnon(
+        val image: KittyImage,
+        val op: KittyProtocolParser.ShowOp,
+        val col: Int,
+        val line: Int,
+        val cols: Int,
+        val rows: Int
+    )
+
+    /**
+     * Anonymous (id 0) frames, e.g. mpv video: a later frame at the same
+     * spot replaces an earlier one within the batch, before any bitmap is
+     * built for the earlier one.
+     */
+    private val pendingAnon = LinkedHashMap<AnonKey, PendingAnon>()
+
+    private fun flushAnonymous() {
+        if (pendingAnon.isEmpty()) return
+        val items = pendingAnon.values.toList()
+        pendingAnon.clear()
+        for (p in items) placeImage(p.image, p.op, p.col, p.line, p.cols, p.rows)
+    }
+
     private fun showImage(image: KittyImage, op: KittyProtocolParser.ShowOp) {
+        lastShowNanos = System.nanoTime()
         val anchorCol = terminalEmulator.getCursorX()
         val anchorLine = terminalEmulator.getScrollbackSize() + terminalEmulator.getCursorY()
+        val (w, h) = croppedSize(image, op)
+        val (cols, rows) = resolveCells(op, w, h)
+        if (!op.noCursorMove) {
+            terminalEmulator.advanceForImage(cols, rows)
+        }
+        if (image.id == 0) {
+            pendingAnon[
+                AnonKey(anchorCol, anchorLine, cols, rows, op.zIndex, op.xOffPx, op.yOffPx)
+            ] = PendingAnon(image, op, anchorCol, anchorLine, cols, rows)
+        } else {
+            placeImage(image, op, anchorCol, anchorLine, cols, rows)
+        }
+    }
+
+    private fun placeImage(
+        image: KittyImage,
+        op: KittyProtocolParser.ShowOp,
+        anchorCol: Int,
+        anchorLine: Int,
+        placeCols: Int,
+        placeRows: Int
+    ) {
         val bitmap = try {
             cropBitmap(image.bitmapOrNull() ?: return, op, image.swapRB)
         } catch (e: Exception) {
             null
         } ?: return
-        val (placeCols, placeRows) = resolveCells(op, bitmap.width, bitmap.height)
         val placed = PlacedImage(
             imageId = image.id,
             bitmap = bitmap,
@@ -297,14 +378,20 @@ class TerminalViewModel @Inject constructor(
             swapRB = image.swapRB
         )
         // Same-id placements replace each other (video frames): no
-        // ghost trail, no unbounded bitmap pile. Displaced bitmaps go
-        // back to the pool only when the store moved on as well.
+        // ghost trail, no unbounded bitmap pile. Anonymous frames replace
+        // an anonymous one in the same cells. Displaced bitmaps are
+        // retired (reused after a grace period) only when the store moved
+        // on as well.
         val parser = kittyRenderer.getParser()
         val previous = _placedImages.value
-        val displaced = if (image.id != 0) {
-            previous.filter { it.imageId == image.id }
-        } else {
-            emptyList()
+        val displaced = previous.filter {
+            if (image.id != 0) {
+                it.imageId == image.id
+            } else {
+                it.imageId == 0 && it.col == anchorCol && it.absLine == anchorLine &&
+                    it.cCells == placeCols && it.rCells == placeRows &&
+                    it.zIndex == op.zIndex && it.xOffPx == op.xOffPx && it.yOffPx == op.yOffPx
+            }
         }
         val next = (previous - displaced.toSet() + placed).takeLast(MAX_PLACED_IMAGES)
         val dropped = previous.filter { old -> next.none { it === old } }
@@ -314,14 +401,11 @@ class TerminalViewModel @Inject constructor(
             if (bmp in released) continue
             val stored = parser.getImage(dead.imageId)?.peekBitmap()
             if (stored == null || stored !== bmp) {
-                BitmapPool.release(bmp)
+                BitmapPool.retire(bmp)
                 released.add(bmp)
             }
         }
         _placedImages.value = next
-        if (!op.noCursorMove) {
-            terminalEmulator.advanceForImage(placeCols, placeRows)
-        }
     }
 
     private fun cropBitmap(
@@ -405,12 +489,38 @@ class TerminalViewModel @Inject constructor(
             if (bmp in released) continue
             val stored = parser.getImage(dead.imageId)?.peekBitmap()
             if (stored == null || stored !== bmp) {
-                BitmapPool.release(bmp)
+                BitmapPool.retire(bmp)
                 released.add(bmp)
             }
         }
         if (sel.freeData) {
             parser.freeUnreferenced(kept.map { it.imageId }.toSet())
+        }
+    }
+
+    private var lastPublishNanos = 0L
+    private var publishScheduled = false
+
+    /**
+     * At most one text-window publish per ~frame: floods (cat, logs, vim
+     * redraws) otherwise copy, rebuild and recompose per read batch. The
+     * first update after a quiet spell goes out immediately, so typing
+     * echo stays instant. Must run on parseDispatcher.
+     */
+    private fun publishViewport() {
+        val wait = MIN_PUBLISH_NANOS - (System.nanoTime() - lastPublishNanos)
+        if (wait <= 0) {
+            lastPublishNanos = System.nanoTime()
+            refreshViewport()
+            return
+        }
+        if (publishScheduled) return
+        publishScheduled = true
+        viewModelScope.launch(parseDispatcher) {
+            delay(wait / 1_000_000 + 1)
+            publishScheduled = false
+            lastPublishNanos = System.nanoTime()
+            refreshViewport()
         }
     }
 
@@ -482,6 +592,8 @@ class TerminalViewModel @Inject constructor(
         resizeNotifyJob?.cancel()
         stopForegroundService()
         sshConnectionManager.disconnect()
+        BitmapPool.clear()
+        KittyProtocolParser.trimMemory()
         _terminalState.value = TerminalState.Disconnected
     }
 
@@ -589,6 +701,9 @@ data class PlacedImage(    val imageId: Int,
 }
 
 private const val MAX_PLACED_IMAGES = 24
+private const val MIN_PUBLISH_NANOS = 16_000_000L
+/** Per-frame timing log line (adb logcat -s KisshBench); off by default. */
+private const val BENCH_LOG = false
 
 /**
  * Swaps red and blue channels on the GPU. Raw-copied RGBA bitmaps hold

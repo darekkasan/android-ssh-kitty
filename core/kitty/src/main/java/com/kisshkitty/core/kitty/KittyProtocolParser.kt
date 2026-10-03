@@ -64,6 +64,13 @@ class KittyProtocolParser {
         var dbgBitmapNanos = 0L
         var dbgSeqs = 0L
 
+        /** Release pooled scratch memory (call when the stream goes idle). */
+        @JvmStatic
+        fun trimMemory() {
+            ScratchPool.clear()
+            ExactPool.clear()
+        }
+
         @JvmStatic
         fun dbgReset() {
             dbgParseNanos = 0L
@@ -120,9 +127,14 @@ class KittyProtocolParser {
      * escapes: setPixels copies out), so video doesn't churn the GC.
      */
     private object ScratchPool {
-        private const val MAX_ARRAYS = 4
-        private const val MAX_BYTES = 64 * 1024 * 1024
+        private const val MAX_ARRAYS = 2
+        private const val MAX_BYTES = 32 * 1024 * 1024
         private val pool = ArrayDeque<IntArray>()
+
+        @Synchronized
+        fun clear() {
+            pool.clear()
+        }
 
         @Synchronized
         fun obtain(size: Int): IntArray {
@@ -144,6 +156,43 @@ class KittyProtocolParser {
             if (pool.size < MAX_ARRAYS && bytes + a.size * 4 <= MAX_BYTES) {
                 pool.addLast(a)
             }
+        }
+    }
+
+    /**
+     * Exact-size upload buffers, recycled once their bitmap is built, so
+     * a 6MB-per-frame stream doesn't allocate a fresh large array each time.
+     */
+    private object ExactPool {
+        private const val MAX_ARRAYS = 2
+        private const val MAX_BYTES = 64 * 1024 * 1024
+        private const val MIN_POOLED = 64 * 1024
+        private val pool = ArrayDeque<ByteArray>()
+
+        @Synchronized
+        fun obtain(size: Int): ByteArray? {
+            val it = pool.iterator()
+            while (it.hasNext()) {
+                val a = it.next()
+                if (a.size == size) {
+                    it.remove()
+                    return a
+                }
+            }
+            return null
+        }
+
+        @Synchronized
+        fun release(a: ByteArray) {
+            if (a.size < MIN_POOLED) return
+            var bytes = 0
+            for (e in pool) bytes += e.size
+            if (pool.size < MAX_ARRAYS && bytes + a.size <= MAX_BYTES) pool.addLast(a)
+        }
+
+        @Synchronized
+        fun clear() {
+            pool.clear()
         }
     }
 
@@ -199,7 +248,7 @@ class KittyProtocolParser {
             fun withExpected(params: Map<String, String>): PendingUpload {
                 val expected = expectedBytes(params)
                 return if (expected > 0) {
-                    PendingUpload(params, ByteArray(expected))
+                    PendingUpload(params, ExactPool.obtain(expected) ?: ByteArray(expected))
                 } else {
                     PendingUpload(params, null, 0, ByteArrayOutputStream(32))
                 }
@@ -703,8 +752,11 @@ class KittyProtocolParser {
                 format = format,
                 swapRB = format == FORMAT_RGBA,
                 loader = {
-                    if (format == FORMAT_RGB) createRgbBitmap(pixels, w, h)
+                    val built = if (format == FORMAT_RGB) createRgbBitmap(pixels, w, h)
                     else createRgbaBitmap(pixels, w, h)
+                    // The bitmap holds a copy: recycle the upload buffer.
+                    ExactPool.release(pixels)
+                    built
                 }
             )
         } else {
@@ -861,6 +913,12 @@ class KittyProtocolParser {
         }
     }
 
+    /** A cut-off graphics string invalidates any half-received upload. */
+    fun abortPendingUploads() {
+        pending.clear()
+        lastChainId = null
+    }
+
     fun clearStoredImages() {
         images.clear()
         numbers.clear()
@@ -985,12 +1043,10 @@ class KittyProtocolParser {
 
     /** True when every RGBA pixel (wire order R,G,B,A) has alpha 0xFF. */
     private fun isFullyOpaque(data: ByteArray, need: Int): Boolean {
-        val ints = java.nio.ByteBuffer.wrap(data, 0, need)
-            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
-            .asIntBuffer()
-        val count = need / 4
-        for (i in 0 until count) {
-            if ((ints.get(i) ushr 24) != 0xFF) return false
+        var i = 3
+        while (i < need) {
+            if (data[i] != (-1).toByte()) return false
+            i += 4
         }
         return true
     }
