@@ -22,11 +22,14 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("KEYSTORE_PATH") ?: "release-key.jks"
-            storeFile = file(keystorePath)
-            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "kisshkitty123"
-            keyAlias = System.getenv("KEY_ALIAS") ?: "kisshkitty"
-            keyPassword = System.getenv("KEY_PASSWORD") ?: "kisshkitty123"
+            // Credentials come from the environment only (CI secrets).
+            val keystorePath = System.getenv("KEYSTORE_PATH")
+            if (keystorePath != null) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
         }
     }
 
