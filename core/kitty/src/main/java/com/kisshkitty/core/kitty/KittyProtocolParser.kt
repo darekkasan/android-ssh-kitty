@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.util.Base64
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.zip.Inflater
 import java.util.zip.InflaterInputStream
 
 /**
@@ -69,6 +70,48 @@ class KittyProtocolParser {
             dbgDecodeNanos = 0L
             dbgBitmapNanos = 0L
             dbgSeqs = 0L
+        }
+    }
+
+    /**
+     * Base64 decoder that writes straight into the destination buffer
+     * (no intermediate array per chunk). Skips whitespace and padding
+     * like android.util.Base64.DEFAULT; throws on other characters.
+     */
+    private object FastBase64 {
+        private val TABLE = IntArray(256) { -1 }.also { t ->
+            val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            for (i in chars.indices) t[chars[i].code] = i
+        }
+
+        /** Bytes written, or -1 when [dst] has no room for them. */
+        fun decodeInto(src: ByteArray, off: Int, len: Int, dst: ByteArray, dstOff: Int): Int {
+            var o = dstOff
+            var acc = 0
+            var bits = 0
+            var pad = false
+            var i = off
+            val end = off + len
+            while (i < end) {
+                val c = src[i++].toInt() and 0xFF
+                val v = TABLE[c]
+                if (v >= 0) {
+                    if (pad) throw IllegalArgumentException("data after padding")
+                    acc = (acc shl 6) or v
+                    bits += 6
+                    if (bits >= 8) {
+                        bits -= 8
+                        if (o >= dst.size) return -1
+                        dst[o++] = (acc shr bits).toByte()
+                        acc = acc and ((1 shl bits) - 1)
+                    }
+                } else if (c == '='.code) {
+                    pad = true
+                } else if (c != 0x0A && c != 0x0D && c != 0x20 && c != 0x09) {
+                    throw IllegalArgumentException("bad base64 character")
+                }
+            }
+            return o - dstOff
         }
     }
 
@@ -187,6 +230,22 @@ class KittyProtocolParser {
                 return true
             }
             overflow!!.write(data)
+            return true
+        }
+
+        /**
+         * Decode a base64 chunk straight into the accumulator. False when
+         * it no longer fits; throws IllegalArgumentException on bad base64.
+         */
+        fun appendBase64(src: ByteArray, off: Int, len: Int): Boolean {
+            val e = exact
+            if (e != null) {
+                val n = FastBase64.decodeInto(src, off, len, e, filled)
+                if (n < 0) return false
+                filled += n
+                return true
+            }
+            overflow!!.write(Base64.decode(src, off, len, Base64.DEFAULT))
             return true
         }
 
@@ -342,12 +401,15 @@ class KittyProtocolParser {
         val cid = lastChainId
         val state = cid?.let { pending[it] } ?: return emptyList()
         if (m == 1) {
-            val data = try {
-                decodeB64(payload, payloadOff, payloadLen)
+            val d0 = System.nanoTime()
+            val fits = try {
+                state.appendBase64(payload, payloadOff, payloadLen)
             } catch (e: Exception) {
                 return abortChain(cid, state, "EINVAL: bad base64 payload")
+            } finally {
+                dbgDecodeNanos += System.nanoTime() - d0
             }
-            if (!state.append(data)) {
+            if (!fits) {
                 return abortChain(cid, state, "EINVAL: upload exceeds declared size")
             }
             if (state.size() > MAX_PENDING_BYTES) {
@@ -360,18 +422,26 @@ class KittyProtocolParser {
         pending.remove(cid)
         if (cid == lastChainId) lastChainId = null
         val first = state.params
-        val finalData = try {
-            decodeB64(payload, payloadOff, payloadLen)
-        } catch (e: Exception) {
-            return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
-        }
-        val complete = if (state.size() > 0) {
-            if (!state.append(finalData)) {
+        val complete: ByteArray
+        if (state.size() > 0) {
+            val d0 = System.nanoTime()
+            val fits = try {
+                state.appendBase64(payload, payloadOff, payloadLen)
+            } catch (e: Exception) {
+                return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
+            } finally {
+                dbgDecodeNanos += System.nanoTime() - d0
+            }
+            if (!fits) {
                 return abortChain(cid, state, "EINVAL: upload exceeds declared size", completed = true)
             }
-            state.bytes()
+            complete = state.bytes()
         } else {
-            finalData
+            complete = try {
+                decodeB64(payload, payloadOff, payloadLen)
+            } catch (e: Exception) {
+                return abortChain(cid, state, "EINVAL: bad base64 payload", completed = true)
+            }
         }
         val finalAction = first["a"] ?: ACTION_TRANSMIT
         val finalQuiet = first["q"]?.toIntOrNull() ?: q
@@ -548,18 +618,31 @@ class KittyProtocolParser {
         var raw = data
         if (params["o"] == "z") {
             raw = try {
-                InflaterInputStream(ByteArrayInputStream(data)).readBytes()
+                inflate(data, rawSizeOf(format, width, height))
             } catch (e: Exception) {
                 return err(quiet, chainId, "EINVAL: bad zlib data", correlate)
             }
         }
 
-        val bitmap = when (format) {
-            FORMAT_RGB -> createRgbBitmap(raw, width, height)
-            FORMAT_RGBA -> createRgbaBitmap(raw, width, height)
-            FORMAT_PNG -> createPngBitmap(raw)
-            else -> null
-        } ?: return err(quiet, chainId, "EINVAL: bad image data", correlate)
+        // Raw pixel uploads are materialized lazily: when a newer frame
+        // supersedes this one before it is ever shown (backlog), no
+        // bitmap is built for it at all. Size is validated up front.
+        val bpp = when (format) {
+            FORMAT_RGB -> 3
+            FORMAT_RGBA -> 4
+            else -> 0
+        }
+        val lazy = action != ACTION_QUERY && bpp > 0 && width > 0 && height > 0 &&
+            raw.size.toLong() >= width.toLong() * height.toLong() * bpp
+        var bitmap: Bitmap? = null
+        if (!lazy) {
+            bitmap = when (format) {
+                FORMAT_RGB -> createRgbBitmap(raw, width, height)
+                FORMAT_RGBA -> createRgbaBitmap(raw, width, height)
+                FORMAT_PNG -> createPngBitmap(raw)
+                else -> null
+            } ?: return err(quiet, chainId, "EINVAL: bad image data", correlate)
+        }
 
         // Query action: validate only, never store or display.
         if (action == ACTION_QUERY) {
@@ -578,16 +661,34 @@ class KittyProtocolParser {
         if (imageId != 0) {
             images.remove(imageId)
         }
-        val image = KittyImage(
-            id = imageId,
-            bitmap = bitmap,
-            width = bitmap.width,
-            height = bitmap.height,
-            format = format,
-            // Raw-copied RGBA holds wire order; the GPU swaps R<->B
-            // at draw time (see the canvas color matrix).
-            swapRB = format == FORMAT_RGBA
-        )
+        val image = if (lazy) {
+            val pixels = raw
+            val w = width
+            val h = height
+            KittyImage(
+                id = imageId,
+                bitmap = null,
+                width = w,
+                height = h,
+                format = format,
+                swapRB = format == FORMAT_RGBA,
+                loader = {
+                    if (format == FORMAT_RGB) createRgbBitmap(pixels, w, h)
+                    else createRgbaBitmap(pixels, w, h)
+                }
+            )
+        } else {
+            KittyImage(
+                id = imageId,
+                bitmap = bitmap,
+                width = bitmap!!.width,
+                height = bitmap.height,
+                format = format,
+                // Raw-copied RGBA holds wire order; the GPU swaps R<->B
+                // at draw time (see the canvas color matrix).
+                swapRB = format == FORMAT_RGBA
+            )
+        }
         if (imageId != 0) {
             images[imageId] = image
             // Evict oldest first, by count and by bytes (video frames are
@@ -712,7 +813,7 @@ class KittyProtocolParser {
     private fun storedBytes(): Long {
         var total = 0L
         for (image in images.values) {
-            total += image.bitmap.width.toLong() * image.bitmap.height.toLong() * 4L
+            total += image.width.toLong() * image.height.toLong() * 4L
         }
         return total
     }
@@ -744,6 +845,39 @@ class KittyProtocolParser {
     // Bitmap decoding
     // ------------------------------------------------------------------
 
+    /** Decoded size of a raw upload, or -1 when unknowable (PNG). */
+    private fun rawSizeOf(format: Int, w: Int, h: Int): Int {
+        val bpp = when (format) {
+            FORMAT_RGB -> 3
+            FORMAT_RGBA -> 4
+            else -> return -1
+        }
+        if (w <= 0 || h <= 0) return -1
+        val total = w.toLong() * h.toLong() * bpp
+        return if (total > 256L * 1024L * 1024L) -1 else total.toInt()
+    }
+
+    /** zlib inflate into an exact-size buffer when the size is known. */
+    private fun inflate(data: ByteArray, expected: Int): ByteArray {
+        if (expected <= 0) {
+            return InflaterInputStream(ByteArrayInputStream(data)).readBytes()
+        }
+        val inflater = Inflater()
+        try {
+            inflater.setInput(data)
+            val out = ByteArray(expected)
+            var n = 0
+            while (n < out.size && !inflater.finished()) {
+                val r = inflater.inflate(out, n, out.size - n)
+                if (r == 0 && (inflater.needsInput() || inflater.needsDictionary())) break
+                n += r
+            }
+            return if (n == out.size) out else out.copyOf(n)
+        } finally {
+            inflater.end()
+        }
+    }
+
     private fun parseControlData(data: String): Map<String, String> {
         if (data.isEmpty()) return emptyMap()
         return data.split(",").associate { pair ->
@@ -769,12 +903,14 @@ class KittyProtocolParser {
             ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val pixels = ScratchPool.obtain(width * height)
 
-        for (i in 0 until width * height) {
-            val offset = i * 3
-            val r = data[offset].toInt() and 0xFF
-            val g = data[offset + 1].toInt() and 0xFF
-            val b = data[offset + 2].toInt() and 0xFF
-            pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        val count = width * height
+        var o = 0
+        for (i in 0 until count) {
+            pixels[i] = (0xFF shl 24) or
+                ((data[o].toInt() and 0xFF) shl 16) or
+                ((data[o + 1].toInt() and 0xFF) shl 8) or
+                (data[o + 2].toInt() and 0xFF)
+            o += 3
         }
 
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
@@ -834,16 +970,31 @@ class KittyProtocolParser {
     }
 }
 
-data class KittyImage(
+class KittyImage(
     val id: Int,
-    val bitmap: Bitmap,
+    bitmap: Bitmap?,
     val width: Int,
     val height: Int,
     val format: Int,
-    val placement: KittyPlacement? = null,
     /** Raw wire-order pixels: swap R<->B on the GPU when drawing. */
-    val swapRB: Boolean = false
-)
+    val swapRB: Boolean = false,
+    /** Builds the bitmap on first use (raw uploads); dropped afterwards. */
+    private var loader: (() -> Bitmap?)? = null
+) {
+    private var cached: Bitmap? = bitmap
+
+    /** The bitmap, building it now if still pending. Null if that fails. */
+    fun bitmapOrNull(): Bitmap? {
+        cached?.let { return it }
+        val l = loader ?: return null
+        loader = null
+        cached = try { l() } catch (e: Exception) { null }
+        return cached
+    }
+
+    /** The bitmap only if already built (never triggers the build). */
+    fun peekBitmap(): Bitmap? = cached
+}
 
 data class KittyPlacement(
     val x: Int = 0,

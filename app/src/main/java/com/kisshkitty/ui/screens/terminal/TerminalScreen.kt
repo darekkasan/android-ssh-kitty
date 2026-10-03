@@ -206,30 +206,79 @@ class TerminalViewModel @Inject constructor(
             // the whole viewport rebuild + recompose for those. At video
             // rates this avoids hundreds of redundant UI passes.
             if (events.isEmpty()) return
-            for (event in events) {
+            // Backlog handling: when one batch holds several frames for the
+            // same image id, only the last stays visible (same-id
+            // placements replace each other). Earlier ones skip the bitmap
+            // build and placement but still move the cursor.
+            val lastShow = HashMap<Int, Int>()
+            for (i in events.indices) {
+                val e = events[i]
+                if (e is KittyImageRenderer.OutputEvent.Show && e.image.id != 0) {
+                    lastShow[e.image.id] = i
+                }
+            }
+            val before = viewportSignature()
+            for ((index, event) in events.withIndex()) {
                 when (event) {
                     is KittyImageRenderer.OutputEvent.Text ->
                         terminalEmulator.processOutput(event.text)
                     is KittyImageRenderer.OutputEvent.Show ->
-                        showImage(event.image, event.op)
+                        if (event.image.id != 0 && lastShow[event.image.id] != index) {
+                            skipImage(event.image, event.op)
+                        } else {
+                            showImage(event.image, event.op)
+                        }
                     is KittyImageRenderer.OutputEvent.Delete ->
                         applyDelete(event.selector)
                     is KittyImageRenderer.OutputEvent.Respond ->
                         sendInput(event.payload)
                 }
             }
-            refreshViewport()
+            // Image-only batches (cursor parked, no text change) leave the
+            // text window identical: skip the rebuild + recompose.
+            if (viewportSignature() != before) refreshViewport()
         } catch (e: Exception) {
             // Log error but don't crash
             e.printStackTrace()
         }
     }
 
+    private data class ViewportSignature(
+        val textVersion: Long,
+        val cursorX: Int,
+        val cursorY: Int,
+        val scrollback: Int,
+        val cursorVisible: Boolean
+    )
+
+    private fun viewportSignature() = ViewportSignature(
+        terminalEmulator.textVersion,
+        terminalEmulator.getCursorX(),
+        terminalEmulator.getCursorY(),
+        terminalEmulator.getScrollbackSize(),
+        terminalEmulator.cursorVisible
+    )
+
+    /** A superseded frame: no bitmap, no placement, same cursor motion. */
+    private fun skipImage(image: KittyImage, op: KittyProtocolParser.ShowOp) {
+        if (op.noCursorMove) return
+        var w = image.width
+        var h = image.height
+        if (op.srcW > 0 && op.srcH > 0) {
+            val x = op.srcX.coerceIn(0, (w - 1).coerceAtLeast(0))
+            val y = op.srcY.coerceIn(0, (h - 1).coerceAtLeast(0))
+            w = op.srcW.coerceIn(1, (w - x).coerceAtLeast(1))
+            h = op.srcH.coerceIn(1, (h - y).coerceAtLeast(1))
+        }
+        val (cols, rows) = resolveCells(op, w, h)
+        terminalEmulator.advanceForImage(cols, rows)
+    }
+
     private fun showImage(image: KittyImage, op: KittyProtocolParser.ShowOp) {
         val anchorCol = terminalEmulator.getCursorX()
         val anchorLine = terminalEmulator.getScrollbackSize() + terminalEmulator.getCursorY()
         val bitmap = try {
-            cropBitmap(image.bitmap, op, image.swapRB)
+            cropBitmap(image.bitmapOrNull() ?: return, op, image.swapRB)
         } catch (e: Exception) {
             null
         } ?: return
@@ -262,7 +311,7 @@ class TerminalViewModel @Inject constructor(
         for (dead in displaced + dropped) {
             val bmp = dead.bitmap
             if (bmp in released) continue
-            val stored = parser.getImage(dead.imageId)?.bitmap
+            val stored = parser.getImage(dead.imageId)?.peekBitmap()
             if (stored == null || stored !== bmp) {
                 BitmapPool.release(bmp)
                 released.add(bmp)
@@ -353,7 +402,7 @@ class TerminalViewModel @Inject constructor(
         for (dead in previous.filter { old -> kept.none { it === old } }) {
             val bmp = dead.bitmap
             if (bmp in released) continue
-            val stored = parser.getImage(dead.imageId)?.bitmap
+            val stored = parser.getImage(dead.imageId)?.peekBitmap()
             if (stored == null || stored !== bmp) {
                 BitmapPool.release(bmp)
                 released.add(bmp)
