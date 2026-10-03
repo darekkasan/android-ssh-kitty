@@ -73,6 +73,10 @@ class SshConnectionManager @Inject constructor() {
             // Open interactive shell with a real terminal type so remote
             // apps (vim, chafa, colors) detect capabilities properly.
             // True window size follows via resizeTerminal().
+            // Image streams are bulk base64: a bigger channel window keeps
+            // the pipe full on high-latency links (sshj default: 2MB/32KB).
+            client.connection.windowSize = 16L * 1024 * 1024
+            client.connection.maxPacketSize = 64 * 1024
             val session = client.startSession()
             session.allocatePTY("xterm-256color", 80, 24, 0, 0, mapOf(PTYMode.ECHO to 1))
             val shell = session.startShell()

@@ -531,7 +531,12 @@ data class PlacedImage(    val imageId: Int,
     val yOffPx: Int,
     val zIndex: Int,
     val swapRB: Boolean
-)
+) {
+    /** Wrapped once per placement, not once per drawn frame. */
+    val imageBitmap: androidx.compose.ui.graphics.ImageBitmap by lazy(LazyThreadSafetyMode.NONE) {
+        bitmap.asImageBitmap()
+    }
+}
 
 private const val MAX_PLACED_IMAGES = 24
 
@@ -1162,7 +1167,7 @@ fun TerminalCanvas(
             val dstW = (p.cCells * cellWidth).coerceAtLeast(1f)
             val dstH = (p.rCells * cellHeight).coerceAtLeast(1f)
             drawImage(
-                image = p.bitmap.asImageBitmap(),
+                image = p.imageBitmap,
                 dstOffset = androidx.compose.ui.unit.IntOffset(
                     (p.col * cellWidth + p.xOffPx).toInt(),
                     (viewRow * cellHeight + p.yOffPx).toInt()
