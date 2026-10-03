@@ -390,14 +390,44 @@ class KittyProtocolParser {
             control == "m=0" -> { m = 0; q = 0 }
             control.startsWith("m=1,q=") -> {
                 m = 1
-                q = control.substring(5).toIntOrNull() ?: return emptyList()
+                q = control.substring(6).toIntOrNull() ?: return emptyList()
             }
             control.startsWith("m=0,q=") -> {
                 m = 0
-                q = control.substring(5).toIntOrNull() ?: return emptyList()
+                q = control.substring(6).toIntOrNull() ?: return emptyList()
             }
             else -> return emptyList()
         }
+        return handleMarker(m, q, payload, payloadOff, payloadLen)
+    }
+
+    /**
+     * Allocation-free entry for bare continuation chunks, for callers
+     * that already recognized "m=<0|1>[,q=<n>]" in the raw bytes.
+     */
+    fun parseMarkerChunk(
+        m: Int,
+        q: Int,
+        payload: ByteArray,
+        payloadOff: Int,
+        payloadLen: Int
+    ): List<KittyEvent> {
+        val t0 = System.nanoTime()
+        try {
+            return handleMarker(m, q, payload, payloadOff, payloadLen)
+        } finally {
+            dbgParseNanos += System.nanoTime() - t0
+            dbgSeqs++
+        }
+    }
+
+    private fun handleMarker(
+        m: Int,
+        q: Int,
+        payload: ByteArray,
+        payloadOff: Int,
+        payloadLen: Int
+    ): List<KittyEvent> {
         val cid = lastChainId
         val state = cid?.let { pending[it] } ?: return emptyList()
         if (m == 1) {
@@ -901,6 +931,8 @@ class KittyProtocolParser {
 
         val bitmap = BitmapPool.obtain(width, height)
             ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        // Every pixel is opaque: let the GPU skip alpha handling.
+        bitmap.setHasAlpha(false)
         val pixels = ScratchPool.obtain(width * height)
 
         val count = width * height
@@ -937,9 +969,30 @@ class KittyProtocolParser {
         // The copy is raw, so mark unpremultiplied to keep alpha exact.
         val bitmap = BitmapPool.obtain(width, height)
             ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        bitmap.setHasAlpha(true)
         bitmap.setPremultiplied(false)
-        bitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(data, 0, need))
+        val buffer = java.nio.ByteBuffer.wrap(data, 0, need)
+        bitmap.copyPixelsFromBuffer(buffer)
+        // Video frames are almost always fully opaque. Marking them so
+        // avoids the unpremultiplied->premultiplied conversion at upload
+        // and alpha blending at draw. Bails at the first translucent
+        // pixel, so real alpha images cost next to nothing here.
+        if (isFullyOpaque(data, need)) {
+            bitmap.setHasAlpha(false)
+        }
         return bitmap
+    }
+
+    /** True when every RGBA pixel (wire order R,G,B,A) has alpha 0xFF. */
+    private fun isFullyOpaque(data: ByteArray, need: Int): Boolean {
+        val ints = java.nio.ByteBuffer.wrap(data, 0, need)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .asIntBuffer()
+        val count = need / 4
+        for (i in 0 until count) {
+            if ((ints.get(i) ushr 24) != 0xFF) return false
+        }
+        return true
     }
 
     private fun createPngBitmap(data: ByteArray): Bitmap? {

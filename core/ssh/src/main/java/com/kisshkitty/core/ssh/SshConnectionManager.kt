@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import net.schmizz.sshj.DefaultConfig
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.common.SecurityUtils
 import net.schmizz.sshj.connection.channel.direct.PTYMode
@@ -51,7 +52,20 @@ class SshConnectionManager @Inject constructor() {
 
     suspend fun connect(config: SshConfig): Result<SshConnection> = withContext(Dispatchers.IO) {
         try {
-            val client = SSHClient()
+            // Prefer AEAD ciphers: encryption and authentication in one pass
+            // instead of AES-CTR plus a separate HMAC. With sshj's pure-Java
+            // crypto that is roughly half the CPU per received byte, which
+            // matters for megabytes/s of base64 image data.
+            val sshjConfig = DefaultConfig()
+            val preferred = listOf(
+                "chacha20-poly1305@openssh.com",
+                "aes128-gcm@openssh.com",
+                "aes256-gcm@openssh.com"
+            )
+            sshjConfig.cipherFactories = sshjConfig.cipherFactories.sortedBy { factory ->
+                preferred.indexOf(factory.name).let { if (it < 0) preferred.size else it }
+            }
+            val client = SSHClient(sshjConfig)
             client.addHostKeyVerifier(config.hostKeyVerifier)
 
             // Configure timeouts

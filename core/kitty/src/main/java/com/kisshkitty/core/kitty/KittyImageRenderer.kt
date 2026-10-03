@@ -16,8 +16,13 @@ class KittyImageRenderer {
 
     private val parser = KittyProtocolParser()
 
-    /** Unprocessed tail: at most one incomplete escape sequence. */
-    private var pending = ByteArray(0)
+    /**
+     * Unprocessed tail (at most one incomplete escape sequence) lives in
+     * [hold]/[holdLen]: a growable buffer appended in place, so a large
+     * upload split over many reads is never re-concatenated.
+     */
+    private var hold = ByteArray(0)
+    private var holdLen = 0
     /** Last time the held-back tail was extended (nanoTime). */
     private var pendingStamp = 0L
 
@@ -42,23 +47,23 @@ class KittyImageRenderer {
         // An unterminated escape (killed program, lost bytes) would
         // otherwise swallow every later byte, prompt and echo included.
         // A partial sequence idle for this long is certainly abandoned.
-        if (pending.isNotEmpty() &&
-            System.nanoTime() - pendingStamp > PENDING_IDLE_NANOS
-        ) {
-            pending = ByteArray(0)
+        if (holdLen > 0 && System.nanoTime() - pendingStamp > PENDING_IDLE_NANOS) {
+            holdLen = 0
         }
+        // The held tail was already scanned up to here: resume the
+        // terminator search just before its end instead of from scratch.
+        val resumeAt = if (holdLen > 0) holdLen - 1 else 0
         val buf: ByteArray
         val n: Int
-        if (pending.isEmpty()) {
+        if (holdLen == 0) {
             buf = data
             n = len
         } else {
-            n = pending.size + len
-            buf = ByteArray(n)
-            System.arraycopy(pending, 0, buf, 0, pending.size)
-            System.arraycopy(data, 0, buf, pending.size, len)
+            n = holdLen + len
+            if (hold.size < n) hold = hold.copyOf(maxOf(n, hold.size * 2))
+            System.arraycopy(data, 0, hold, holdLen, len)
+            buf = hold
         }
-        pending = ByteArray(0)
         val events = mutableListOf<OutputEvent>()
         var pos = 0
         var textStart = 0
@@ -83,7 +88,7 @@ class KittyImageRenderer {
                 pos = safe
                 break
             }
-            val end = escapeEnd(buf, esc, n)
+            val end = escapeEnd(buf, esc, n, if (esc == 0) resumeAt else 0)
             if (end == -1) {
                 // Incomplete escape: emit text before it, hold the rest.
                 flushText(esc)
@@ -93,7 +98,8 @@ class KittyImageRenderer {
             if (isGraphicsApc(buf, esc, end)) {
                 flushText(esc)
                 val innerStart = esc + 3
-                val innerEnd = end - 2
+                // ST is two bytes (ESC \), BEL is one.
+                val innerEnd = if (buf[end - 1] == 0x07.toByte()) end - 1 else end - 2
                 var semi = -1
                 var j = innerStart
                 while (j < innerEnd) {
@@ -103,19 +109,19 @@ class KittyImageRenderer {
                     }
                     j++
                 }
-                val control: String
-                val payOff: Int
-                val payLen: Int
-                if (semi == -1) {
-                    control = String(buf, innerStart, innerEnd - innerStart, Charsets.US_ASCII)
-                    payOff = innerEnd
-                    payLen = 0
+                val ctrlEnd = if (semi == -1) innerEnd else semi
+                val payOff = if (semi == -1) innerEnd else semi + 1
+                val payLen = innerEnd - payOff
+                // Bare continuation chunks (m=0/1[,q=N]) are nearly all of
+                // video traffic: recognize them in the raw bytes, no String.
+                val marker = markerOf(buf, innerStart, ctrlEnd)
+                val parsed = if (marker >= 0) {
+                    parser.parseMarkerChunk(marker shr 8, marker and 0xFF, buf, payOff, payLen)
                 } else {
-                    control = String(buf, innerStart, semi - innerStart, Charsets.US_ASCII)
-                    payOff = semi + 1
-                    payLen = innerEnd - payOff
+                    val control = String(buf, innerStart, ctrlEnd - innerStart, Charsets.US_ASCII)
+                    parser.parseControl(control, buf, payOff, payLen)
                 }
-                for (event in parser.parseControl(control, buf, payOff, payLen)) {
+                for (event in parsed) {
                     events.add(
                         when (event) {
                             is KittyEvent.Show -> OutputEvent.Show(event.image, event.op)
@@ -135,13 +141,24 @@ class KittyImageRenderer {
 
         // Cap the hold-back so an abandoned escape can never grow
         // unbounded: flush it as plain text.
-        if (n - pos > 1_000_000) {
+        if (n - pos > MAX_HOLD_BYTES) {
             flushText(n)
             pos = n
         }
-        if (pos < n) {
-            pending = buf.copyOfRange(pos, n)
+        val tail = n - pos
+        if (tail > 0) {
+            if (buf === hold) {
+                if (pos > 0) System.arraycopy(hold, pos, hold, 0, tail)
+            } else {
+                if (hold.size < tail) hold = ByteArray(maxOf(tail, 1024))
+                System.arraycopy(buf, pos, hold, 0, tail)
+            }
+            holdLen = tail
             pendingStamp = System.nanoTime()
+        } else {
+            holdLen = 0
+            // Don't keep a huge buffer alive after a big upload.
+            if (hold.size > HOLD_KEEP_BYTES) hold = ByteArray(0)
         }
         return KittyOutput(events)
     }
@@ -156,7 +173,7 @@ class KittyImageRenderer {
     }
 
     /** Exclusive end index of the escape starting at [esc], or -1. */
-    private fun escapeEnd(buf: ByteArray, esc: Int, n: Int): Int {
+    private fun escapeEnd(buf: ByteArray, esc: Int, n: Int, resumeAt: Int = 0): Int {
         if (esc + 1 >= n) return -1
         return when (buf[esc + 1].toInt().toChar()) {
             '[' -> {
@@ -166,7 +183,7 @@ class KittyImageRenderer {
                 if (i < n) i + 1 else -1
             }
             ']', 'P', 'X', '^', '_' -> {
-                var i = esc + 2
+                var i = maxOf(esc + 2, resumeAt)
                 while (i < n) {
                     val b = buf[i].toInt() and 0xFF
                     if (b == 0x07) return i + 1
@@ -182,6 +199,30 @@ class KittyImageRenderer {
             '#', '(', ')', '%', '&' -> if (esc + 2 < n) esc + 3 else -1
             else -> esc + 2
         }
+    }
+
+    /**
+     * Recognizes "m=0|1" with optional ",q=<digits>" in [from, to).
+     * Returns (m shl 8) or q, or -1 for anything else.
+     */
+    private fun markerOf(buf: ByteArray, from: Int, to: Int): Int {
+        val len = to - from
+        if (len < 3 || buf[from] != 'm'.code.toByte() || buf[from + 1] != '='.code.toByte()) return -1
+        val mc = buf[from + 2].toInt()
+        if (mc != '0'.code && mc != '1'.code) return -1
+        val m = mc - '0'.code
+        if (len == 3) return m shl 8
+        if (len < 7 || buf[from + 3] != ','.code.toByte() ||
+            buf[from + 4] != 'q'.code.toByte() || buf[from + 5] != '='.code.toByte()
+        ) return -1
+        var q = 0
+        for (i in from + 6 until to) {
+            val d = buf[i].toInt() - '0'.code
+            if (d < 0 || d > 9) return -1
+            q = q * 10 + d
+            if (q > 0xFF) return -1
+        }
+        return (m shl 8) or q
     }
 
     private fun isGraphicsApc(buf: ByteArray, esc: Int, end: Int): Boolean {
@@ -225,5 +266,9 @@ class KittyImageRenderer {
 
     private companion object {
         const val PENDING_IDLE_NANOS = 3_000_000_000L
+        /** Largest held-back tail (one big unchunked upload). */
+        const val MAX_HOLD_BYTES = 48 * 1024 * 1024
+        /** Hold buffers above this are released once drained. */
+        const val HOLD_KEEP_BYTES = 4 * 1024 * 1024
     }
 }
