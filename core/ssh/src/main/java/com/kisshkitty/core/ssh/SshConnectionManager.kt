@@ -73,9 +73,9 @@ class SshConnectionManager @Inject constructor() {
             // Open interactive shell with a real terminal type so remote
             // apps (vim, chafa, colors) detect capabilities properly.
             // True window size follows via resizeTerminal().
-            // Image streams are bulk base64: a bigger channel window keeps
-            // the pipe full on high-latency links (sshj default: 2MB/32KB).
-            client.connection.windowSize = 16L * 1024 * 1024
+            // Keep the window at sshj's 2MB default: a bigger one lets a
+            // flood (mpv video) queue up megabytes that must all be parsed
+            // before the prompt/echo returns after the stream stops.
             client.connection.maxPacketSize = 64 * 1024
             val session = client.startSession()
             session.allocatePTY("xterm-256color", 80, 24, 0, 0, mapOf(PTYMode.ECHO to 1))
@@ -115,18 +115,30 @@ class SshConnectionManager @Inject constructor() {
     }
 
     /** Single reusable read buffer: only the reader loop touches it. */
-    val readBuffer = ByteArray(MAX_READ_BYTES)
+    val readBuffer = ByteArray(MAX_BATCH_BYTES)
 
     /**
-     * Blocks until output arrives, then reads once into [readBuffer].
-     * Returns the byte count, or -1 on EOF/error. Call from an IO thread;
-     * disconnect() closes the stream, which unblocks a pending read.
-     * No polling delay: a frame is parsed the moment it arrives.
+     * Blocks until output arrives, then drains whatever else is already
+     * buffered (up to [MAX_BATCH_BYTES]) into [readBuffer] as one batch.
+     * Batching lets the parser skip superseded video frames instead of
+     * building every one under backlog. Returns the byte count, or -1 on
+     * EOF/error. Call from an IO thread; disconnect() closes the stream,
+     * which unblocks a pending read.
      */
     fun readFromTerminal(): Int {
         return try {
             val input = inputStream ?: return -1
-            input.read(readBuffer, 0, MAX_READ_BYTES)
+            var total = input.read(readBuffer, 0, MAX_READ_BYTES)
+            if (total <= 0) return -1
+            while (total < MAX_BATCH_BYTES && input.available() > 0) {
+                val n = input.read(
+                    readBuffer, total,
+                    minOf(MAX_READ_BYTES, MAX_BATCH_BYTES - total)
+                )
+                if (n <= 0) break
+                total += n
+            }
+            total
         } catch (e: Exception) {
             Log.e("SshConnectionManager", "Read failed", e)
             -1
@@ -190,3 +202,4 @@ data class SshConnection(
 )
 
 private const val MAX_READ_BYTES = 262144
+private const val MAX_BATCH_BYTES = 4 * 1024 * 1024
