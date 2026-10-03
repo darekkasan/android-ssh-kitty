@@ -33,6 +33,13 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.nativeKeyCode
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onPlaced
 import androidx.compose.ui.layout.onSizeChanged
@@ -1146,6 +1153,16 @@ fun TerminalScreen(
                 },
                 modifier = Modifier
                     .focusRequester(focusRequester)
+                    .onPreviewKeyEvent { event ->
+                        // Physical keyboards: control keys never reach the
+                        // text field as text, and held keys auto-repeat as
+                        // repeated KeyDown events.
+                        if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                        val seq = hardwareKeySequence(event.key, event.isCtrlPressed)
+                            ?: return@onPreviewKeyEvent false
+                        viewModel.sendInput(seq)
+                        true
+                    }
                     .size(1.dp)
                     .alpha(0.01f)
                     .onPlaced { isTextFieldPlaced = true },
@@ -1219,7 +1236,7 @@ fun TerminalScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly
                     ) {
-                        SpecialKeyButton("Tab") { viewModel.sendSpecialKey(SpecialKey.TAB) }
+                        SpecialKeyButton("Tab", repeatable = true) { viewModel.sendSpecialKey(SpecialKey.TAB) }
                         SpecialKeyButton("Esc") { viewModel.sendSpecialKey(SpecialKey.ESC) }
                         SpecialKeyButton("Paste") {
                             val clip = clipboard.getText()?.text ?: ""
@@ -1243,11 +1260,11 @@ fun TerminalScreen(
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        SpecialKeyButton("↑") { viewModel.sendSpecialKey(SpecialKey.UP) }
+                        SpecialKeyButton("↑", repeatable = true) { viewModel.sendSpecialKey(SpecialKey.UP) }
                         Spacer(modifier = Modifier.width(8.dp))
-                        SpecialKeyButton("←") { viewModel.sendSpecialKey(SpecialKey.LEFT) }
-                        SpecialKeyButton("↓") { viewModel.sendSpecialKey(SpecialKey.DOWN) }
-                        SpecialKeyButton("→") { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
+                        SpecialKeyButton("←", repeatable = true) { viewModel.sendSpecialKey(SpecialKey.LEFT) }
+                        SpecialKeyButton("↓", repeatable = true) { viewModel.sendSpecialKey(SpecialKey.DOWN) }
+                        SpecialKeyButton("→", repeatable = true) { viewModel.sendSpecialKey(SpecialKey.RIGHT) }
                     }
                 }
 
@@ -1439,13 +1456,60 @@ fun ScrollStrip(
 @Composable
 fun SpecialKeyButton(
     text: String,
+    repeatable: Boolean = false,
     onClick: () -> Unit
 ) {
+    // Press-and-hold auto-repeat (after a short delay) for cursor keys etc.
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    // Set once repeating began, so the click fired on release is swallowed.
+    val repeated = remember { booleanArrayOf(false) }
+    LaunchedEffect(pressed, repeatable) {
+        if (pressed && repeatable) {
+            repeated[0] = false
+            delay(400)
+            repeated[0] = true
+            while (true) {
+                onClick()
+                delay(50)
+            }
+        }
+    }
     Button(
-        onClick = onClick,
+        onClick = {
+            if (repeated[0]) repeated[0] = false else onClick()
+        },
         modifier = Modifier.height(40.dp),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+        interactionSource = interaction
     ) {
         Text(text, style = MaterialTheme.typography.labelSmall)
     }
+}
+
+/**
+ * Escape sequence for a physical-keyboard key, or null to let the text
+ * field handle it (printable characters, Enter, ...).
+ */
+private fun hardwareKeySequence(key: Key, ctrl: Boolean): String? {
+    when (key) {
+        Key.DirectionUp -> return "\u001B[A"
+        Key.DirectionDown -> return "\u001B[B"
+        Key.DirectionRight -> return "\u001B[C"
+        Key.DirectionLeft -> return "\u001B[D"
+        Key.MoveHome -> return "\u001B[H"
+        Key.MoveEnd -> return "\u001B[F"
+        Key.PageUp -> return "\u001B[5~"
+        Key.PageDown -> return "\u001B[6~"
+        Key.Delete -> return "\u001B[3~"
+        Key.Escape -> return "\u001B"
+        Key.Tab -> return "\t"
+    }
+    if (ctrl) {
+        val code = key.nativeKeyCode
+        if (code in android.view.KeyEvent.KEYCODE_A..android.view.KeyEvent.KEYCODE_Z) {
+            return (code - android.view.KeyEvent.KEYCODE_A + 1).toChar().toString()
+        }
+    }
+    return null
 }

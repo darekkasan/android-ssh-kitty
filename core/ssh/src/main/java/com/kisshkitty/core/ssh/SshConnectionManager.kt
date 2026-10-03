@@ -84,6 +84,13 @@ class SshConnectionManager @Inject constructor() {
                 else -> throw IllegalStateException("Either password or keyPath must be provided")
             }
 
+            // Small keystroke packets must not wait on Nagle/delayed-ACK.
+            try {
+                client.socket.tcpNoDelay = true
+            } catch (e: Exception) {
+                Log.w("SshConnectionManager", "TCP_NODELAY failed", e)
+            }
+
             // Open interactive shell with a real terminal type so remote
             // apps (vim, chafa, colors) detect capabilities properly.
             // True window size follows via resizeTerminal().
